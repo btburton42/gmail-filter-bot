@@ -1,0 +1,47 @@
+# Example filters.yaml file
+# Copy this to filters.yaml and add your entries
+# filters.yaml is gitignored - do not commit it!
+
+# Maximum entries per Gmail filter (Gmail API limit is ~50)
+max_entries_per_filter: 50
+
+# Filter definitions
+filters:
+  newsletters:
+    action: label_and_archive
+    label: Newsletters
+    entries:
+      - newsletter1@example.com
+      - newsletter2@example.com
+      - updates@company.com
+  
+  shopping:
+    action: label_only
+    label: Shopping
+    entries:
+      - orders@amazon.com
+      - receipts@target.com
+      - confirmation@ebay.com
+  
+  social:
+    action: archive
+    entries:
+      - noreply@facebook.com
+      - notifications@twitter.com
+      - updates@linkedin.com
+  
+  promotions:
+    action: label_and_archive
+    label: Promotions
+    entries:
+      - deals@retailer.com
+      - offers@store.com
+
+# Available actions:
+# - label_only: Apply label only
+# - label_and_archive: Apply label and archive
+# - archive: Archive only
+# - delete: Delete messages
+# - mark_important: Mark as important
+# - mark_not_important: Mark as not important
+# - star: Star messages
