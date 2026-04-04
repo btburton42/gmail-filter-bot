@@ -46,9 +46,7 @@ class FilterManager:
                 filter_config.action in ["label_only", "label_and_archive"]
                 and not filter_config.label
             ):
-                errors.append(
-                    f"{name}: Action '{filter_config.action}' requires a label"
-                )
+                errors.append(f"{name}: Action '{filter_config.action}' requires a label")
 
             # Check entry count
             entry_count = len(filter_config.entries)
@@ -125,12 +123,13 @@ class FilterManager:
 
         return changes
 
-    def push(self) -> dict[str, Any]:
+    def push(self, apply_to_existing: bool = False) -> dict[str, Any]:
         """Push local filters to Gmail."""
         results = {
             "created": 0,
             "updated": 0,
             "split_filters": [],
+            "applied_to_existing": 0,
         }
 
         # Get existing remote filters
@@ -139,11 +138,16 @@ class FilterManager:
         # Delete existing filters that match our base names
         # (we'll recreate them properly)
         base_names = set(self.config.filters.keys())
+        deleted_count = 0
         for rf in remote_filters:
             base_name = self._extract_base_name(rf)
             if base_name in base_names:
                 self.client.delete_filter(rf["id"])
                 results["updated"] += 1
+                deleted_count += 1
+
+        if deleted_count > 0:
+            print(f"  ✓ Deleted {deleted_count} existing filter(s)")
 
         # Create new filters
         for name, filter_config in self.config.filters.items():
@@ -153,17 +157,30 @@ class FilterManager:
                 # Create single filter
                 self._create_filter_with_entries(name, filter_config, entries)
                 results["created"] += 1
+                print(f"  ✓ Created filter: {name} ({len(entries)} entries)")
             else:
                 # Split into multiple filters
                 parts = self._split_entries(entries, self.config.max_entries_per_filter)
                 for i, part_entries in enumerate(parts, 1):
                     part_name = name if i == 1 else f"{name}-{i}"
-                    self._create_filter_with_entries(
-                        part_name, filter_config, part_entries
-                    )
+                    self._create_filter_with_entries(part_name, filter_config, part_entries)
                     results["created"] += 1
+                    print(f"  ✓ Created filter: {part_name} ({len(part_entries)} entries)")
 
                 results["split_filters"].append(name)
+                print(f"  ✓ Split '{name}' into {len(parts)} part(s)")
+
+            # Apply labels to existing conversations if requested
+            if apply_to_existing and filter_config.label:
+                print(f"  → Applying label '{filter_config.label}' to existing conversations...")
+                label_id = self.client._get_or_create_label(filter_config.label)
+                archive = filter_config.action in ["label_and_archive", "archive"]
+                modified_count = self.client.apply_label_to_existing(
+                    entries, label_id, archive=archive
+                )
+                results["applied_to_existing"] += modified_count
+                if modified_count > 0:
+                    print(f"    ✓ Applied to {modified_count} conversation(s)")
 
         return results
 
@@ -242,44 +259,44 @@ class FilterManager:
 
     def format_filters(self, dry_run: bool = False) -> dict[str, Any]:
         """Consolidate filters with the same action and label.
-        
+
         This merges filters that have identical actions and labels into a single
         filter with all entries combined.
         """
         from collections import defaultdict
-        
+
         # Group filters by (action, label) tuple
         groups: dict[tuple[str, str | None], list[tuple[str, FilterConfig]]] = defaultdict(list)
-        
+
         for name, filter_config in self.config.filters.items():
             key = (filter_config.action, filter_config.label)
             groups[key].append((name, filter_config))
-        
+
         results = {
             "consolidated": [],
         }
-        
+
         # Find groups with more than one filter
         filters_to_remove = []
-        
+
         for (action, label), filter_list in groups.items():
             if len(filter_list) <= 1:
                 continue
-            
+
             # Use the first filter name as the consolidated name
             primary_name = filter_list[0][0]
             primary_filter = filter_list[0][1]
-            
+
             # Collect all unique entries
             all_entries = []
             removed_names = []
-            
+
             for name, filter_config in filter_list:
                 all_entries.extend(filter_config.entries)
                 if name != primary_name:
                     removed_names.append(name)
                     filters_to_remove.append(name)
-            
+
             # Remove duplicates while preserving order
             seen = set()
             unique_entries = []
@@ -287,27 +304,29 @@ class FilterManager:
                 if entry not in seen:
                     seen.add(entry)
                     unique_entries.append(entry)
-            
-            results["consolidated"].append({
-                "name": primary_name,
-                "action": action,
-                "label": label,
-                "source_count": len(filter_list),
-                "total_entries": len(unique_entries),
-                "removed_filters": removed_names,
-            })
-            
+
+            results["consolidated"].append(
+                {
+                    "name": primary_name,
+                    "action": action,
+                    "label": label,
+                    "source_count": len(filter_list),
+                    "total_entries": len(unique_entries),
+                    "removed_filters": removed_names,
+                }
+            )
+
             if not dry_run:
                 # Update the primary filter with all entries
                 self.config.filters[primary_name].entries = unique_entries
-        
+
         if not dry_run:
             # Remove the consolidated filters
             for name in filters_to_remove:
                 del self.config.filters[name]
-            
+
             # Save if changes were made
             if filters_to_remove:
                 self.config.save(self.config_path)
-        
+
         return results

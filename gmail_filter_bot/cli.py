@@ -44,6 +44,11 @@ def main():
         action="store_true",
         help="Skip confirmation prompt",
     )
+    push_parser.add_argument(
+        "--no-apply-existing",
+        action="store_true",
+        help="Don't apply labels to existing conversations (default: labels are applied to existing messages)",
+    )
 
     # trim command
     subparsers.add_parser("trim", help="Remove duplicates and consolidate entries")
@@ -188,7 +193,7 @@ def cmd_push(manager: FilterManager, args):
             print("Aborted.")
             return 0
 
-    results = manager.push()
+    results = manager.push(apply_to_existing=not getattr(args, "no_apply_existing", False))
 
     print(f"\nPushed {results['created']} filter(s), updated {results['updated']} filter(s)")
 
@@ -196,6 +201,9 @@ def cmd_push(manager: FilterManager, args):
         print("\nAuto-split filters:")
         for name in results["split_filters"]:
             print(f"  - {name}")
+
+    if results.get("applied_to_existing"):
+        print(f"\nApplied labels to {results['applied_to_existing']} existing conversation(s)")
 
     return 0
 

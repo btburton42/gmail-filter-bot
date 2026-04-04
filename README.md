@@ -105,7 +105,7 @@ Available actions:
 |---------|-------------|-------|
 | `init` | Import existing Gmail filters from your account into `filters.yaml`. Perfect if you already have filters set up in Gmail. | `--dry-run`: Preview without creating file<br>`--force`: Overwrite existing filters.yaml<br>`--format`: Consolidate similar filters after import |
 | `sync` | Pull current Gmail filters and merge any changes into your local `filters.yaml`. | `--dry-run`: Show changes without applying |
-| `push` | Apply your local `filters.yaml` configuration to Gmail. Auto-splits filters if entry limits are exceeded. | `--force`: Skip confirmation prompt |
+| `push` | Apply your local `filters.yaml` configuration to Gmail. Auto-splits filters if entry limits are exceeded. **By default, labels are applied to existing conversations.** | `--force`: Skip confirmation prompt<br>`--no-apply-existing`: Don't apply labels to existing conversations |
 | `list` | Display all configured filters with their actions, labels, and entry counts. | `--show-entries`: Show all email addresses for each filter |
 | `trim` | Remove duplicate entries from all filters. | - |
 | `format` | Consolidate filters with the same action and label into single filters. | `--dry-run`: Preview changes without modifying |

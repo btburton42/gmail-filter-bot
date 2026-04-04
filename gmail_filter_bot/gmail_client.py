@@ -15,6 +15,7 @@ from .config import Credentials
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/gmail.labels",
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 
 
@@ -203,3 +204,74 @@ class GmailClient:
         """Clear the label cache to force refresh."""
         if hasattr(self, "_label_cache"):
             delattr(self, "_label_cache")
+
+    def apply_label_to_existing(
+        self,
+        from_addresses: list[str],
+        label_id: str,
+        archive: bool = False,
+    ) -> int:
+        """Apply label to existing messages matching the from addresses.
+
+        This mimics the "Also apply filter to X matching conversations" option
+        in the Gmail web UI when creating a filter.
+
+        Args:
+            from_addresses: List of email addresses to search for
+            label_id: Label ID to apply
+            archive: Whether to also archive (remove from inbox)
+
+        Returns:
+            Number of messages modified
+        """
+        from googleapiclient.errors import HttpError
+
+        total_modified = 0
+
+        # Search for messages matching each from address
+        for from_addr in from_addresses:
+            query = f"from:{from_addr}"
+
+            try:
+                # Get messages matching the query
+                results = (
+                    self.service.users()
+                    .messages()
+                    .list(
+                        userId="me",
+                        q=query,
+                    )
+                    .execute()
+                )
+
+                messages = results.get("messages", [])
+
+                if not messages:
+                    continue
+
+                # Batch modify messages in chunks of 1000
+                message_ids = [msg["id"] for msg in messages]
+
+                for i in range(0, len(message_ids), 1000):
+                    chunk = message_ids[i : i + 1000]
+
+                    body = {
+                        "ids": chunk,
+                        "addLabelIds": [label_id],
+                    }
+
+                    if archive:
+                        body["removeLabelIds"] = ["INBOX"]
+
+                    self.service.users().messages().batchModify(
+                        userId="me",
+                        body=body,
+                    ).execute()
+
+                    total_modified += len(chunk)
+
+            except HttpError as e:
+                print(f"Warning: Could not apply label to messages from {from_addr}: {e}")
+                continue
+
+        return total_modified
