@@ -1,10 +1,49 @@
 """Filter management logic for Gmail Filter Bot."""
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .config import Config, FilterConfig
 from .gmail_client import GmailClient
+
+
+@dataclass
+class FilterChange:
+    """Represents changes detected between local and remote filter entries.
+
+    Attributes:
+        name: The name of the filter
+        local_only: Entries present locally but not remotely (would be added to Gmail on push)
+        remote_only: Entries present remotely but not locally (would be added to local on sync)
+    """
+
+    name: str
+    local_only: set[str] = field(default_factory=set)
+    remote_only: set[str] = field(default_factory=set)
+
+    @property
+    def has_changes(self) -> bool:
+        """Check if there are any differences between local and remote."""
+        return bool(self.local_only or self.remote_only)
+
+    @property
+    def added_to_remote(self) -> list[str]:
+        """Entries that exist in Gmail but not locally (would be added on sync)."""
+        return sorted(self.remote_only)
+
+    @property
+    def removed_from_remote(self) -> list[str]:
+        """Entries that exist locally but were removed from Gmail (would be removed on sync)."""
+        return sorted(self.local_only)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert change to dictionary for serialization."""
+        return {
+            "name": self.name,
+            "added": self.added_to_remote,
+            "removed": self.removed_from_remote,
+        }
 
 
 class FilterManager:
@@ -73,59 +112,102 @@ class FilterManager:
             "total_entries": total_entries,
         }
 
-    def sync(self, dry_run: bool = False) -> list[dict[str, Any]]:
-        """Sync Gmail filters with local configuration."""
-        changes = []
+    def compare_filter_entries(
+        self, local_entries: set[str], remote_entries: set[str]
+    ) -> FilterChange:
+        """Compare local and remote filter entries.
 
-        # Get remote filters
+        Args:
+            local_entries: Set of entries from local configuration
+            remote_entries: Set of entries from Gmail
+
+        Returns:
+            FilterChange object describing the differences
+        """
+        return FilterChange(
+            name="",  # Name will be set by caller
+            local_only=local_entries - remote_entries,
+            remote_only=remote_entries - local_entries,
+        )
+
+    def get_remote_filter_entries(self, name: str, remote_filters: list[dict]) -> set[str]:
+        """Extract all entries from remote filters matching a base name.
+
+        Args:
+            name: Base filter name to match
+            remote_filters: List of remote filter objects from Gmail API
+
+        Returns:
+            Set of all entries from matching remote filters
+        """
+        remote_entries: set[str] = set()
+
+        for rf in remote_filters:
+            base_name = self._match_filter_to_local(rf)
+            if base_name == name:
+                remote_entries.update(self.client.parse_filter_entries(rf))
+
+        return remote_entries
+
+    def detect_changes(self) -> list[FilterChange]:
+        """Detect differences between local filters and Gmail.
+
+        Compares local filter configurations with remote Gmail filters
+        to identify what would change during a sync operation.
+
+        Returns:
+            List of FilterChange objects for filters with differences
+        """
+        changes: list[FilterChange] = []
+
+        # Get remote filters once
         remote_filters = self.client.list_filters()
 
-        # Group remote filters by base name (handling split filters)
-        remote_by_base: dict[str, list[dict]] = {}
-        for rf in remote_filters:
-            # Extract filter name from criteria (we'll store it differently)
-            entries = self.client.parse_filter_entries(rf)
-            # Try to match with local filters
-            base_name = self._match_filter_to_local(rf)
-            if base_name:
-                if base_name not in remote_by_base:
-                    remote_by_base[base_name] = []
-                remote_by_base[base_name].append(rf)
-
-        # Compare with local filters
+        # Compare each local filter with remote
         for name, local_filter in self.config.filters.items():
             local_entries = set(local_filter.entries)
+            remote_entries = self.get_remote_filter_entries(name, remote_filters)
 
-            # Get all entries from remote filters with this base name
-            remote_entries = set()
-            if name in remote_by_base:
-                for rf in remote_by_base[name]:
-                    remote_entries.update(self.client.parse_filter_entries(rf))
+            change = self.compare_filter_entries(local_entries, remote_entries)
+            change.name = name
 
-            # Calculate differences
-            added = remote_entries - local_entries
-            removed = local_entries - remote_entries
-
-            if added or removed:
-                change = {
-                    "name": name,
-                    "added": list(added),
-                    "removed": list(removed),
-                }
+            if change.has_changes:
                 changes.append(change)
 
-                if not dry_run:
-                    # Update local filter
-                    self.config.filters[name].entries = list(remote_entries)
+        return changes
+
+    def sync(self, dry_run: bool = False) -> list[FilterChange]:
+        """Sync Gmail filters with local configuration.
+
+        Updates local filter entries to match what's in Gmail,
+        effectively pulling any changes made in the Gmail UI.
+
+        Args:
+            dry_run: If True, only detect changes without applying them
+
+        Returns:
+            List of FilterChange objects describing what changed
+        """
+        changes = self.detect_changes()
 
         if not dry_run and changes:
+            # Update local filters to match remote
+            for change in changes:
+                # Get all remote entries for this filter
+                remote_filters = self.client.list_filters()
+                remote_entries = self.get_remote_filter_entries(change.name, remote_filters)
+
+                # Update local filter with remote entries
+                self.config.filters[change.name].entries = sorted(remote_entries)
+
+            # Save updated configuration
             self.config.save(self.config_path)
 
         return changes
 
     def push(self, apply_to_existing: bool = False) -> dict[str, Any]:
         """Push local filters to Gmail."""
-        results = {
+        results: dict[str, Any] = {
             "created": 0,
             "updated": 0,
             "split_filters": [],
@@ -186,7 +268,7 @@ class FilterManager:
 
     def trim(self) -> dict[str, Any]:
         """Remove duplicates and consolidate entries."""
-        results = {
+        results: dict[str, Any] = {
             "duplicates": 0,
             "filters": [],
         }
@@ -223,7 +305,7 @@ class FilterManager:
         name: str,
         filter_config: FilterConfig,
         entries: list[str],
-    ):
+    ) -> None:
         """Create a single filter with given entries."""
         self.client.create_filter(
             from_addresses=entries,
@@ -233,9 +315,6 @@ class FilterManager:
 
     def _extract_base_name(self, filter_obj: dict) -> str:
         """Extract base filter name from remote filter."""
-        # This is tricky since Gmail doesn't store our custom names
-        # We'll need to match by entries or use a different strategy
-        # For now, return a placeholder
         entries = self.client.parse_filter_entries(filter_obj)
         # Try to find matching local filter by entries
         for name, local_filter in self.config.filters.items():
@@ -272,12 +351,12 @@ class FilterManager:
             key = (filter_config.action, filter_config.label)
             groups[key].append((name, filter_config))
 
-        results = {
+        results: dict[str, Any] = {
             "consolidated": [],
         }
 
         # Find groups with more than one filter
-        filters_to_remove = []
+        filters_to_remove: list[str] = []
 
         for (action, label), filter_list in groups.items():
             if len(filter_list) <= 1:
@@ -285,11 +364,10 @@ class FilterManager:
 
             # Use the first filter name as the consolidated name
             primary_name = filter_list[0][0]
-            primary_filter = filter_list[0][1]
 
             # Collect all unique entries
-            all_entries = []
-            removed_names = []
+            all_entries: list[str] = []
+            removed_names: list[str] = []
 
             for name, filter_config in filter_list:
                 all_entries.extend(filter_config.entries)
@@ -298,8 +376,8 @@ class FilterManager:
                     filters_to_remove.append(name)
 
             # Remove duplicates while preserving order
-            seen = set()
-            unique_entries = []
+            seen: set[str] = set()
+            unique_entries: list[str] = []
             for entry in all_entries:
                 if entry not in seen:
                     seen.add(entry)

@@ -156,11 +156,11 @@ def cmd_sync(manager: FilterManager, args):
 
     print(f"\nFound {len(changes)} filter(s) with differences:")
     for change in changes:
-        print(f"\n  {change['name']}:")
-        if change.get("added"):
-            print(f"    + {len(change['added'])} new entries")
-        if change.get("removed"):
-            print(f"    - {len(change['removed'])} removed entries")
+        print(f"\n  {change.name}:")
+        if change.added_to_remote:
+            print(f"    + {len(change.added_to_remote)} new entries (from Gmail)")
+        if change.removed_from_remote:
+            print(f"    - {len(change.removed_from_remote)} removed entries (from Gmail)")
 
     if not args.dry_run:
         print("\nLocal filters.yaml has been updated with Gmail changes.")
