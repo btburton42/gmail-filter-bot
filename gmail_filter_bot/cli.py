@@ -49,6 +49,16 @@ def main():
         action="store_true",
         help="Don't apply labels to existing conversations (default: labels are applied to existing messages)",
     )
+    push_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed comparison info for debugging",
+    )
+    push_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be pushed without making changes",
+    )
 
     # trim command
     subparsers.add_parser("trim", help="Remove duplicates and consolidate entries")
@@ -170,7 +180,10 @@ def cmd_sync(manager: FilterManager, args):
 
 def cmd_push(manager: FilterManager, args):
     """Handle push command."""
-    print("Pushing local filters to Gmail...")
+    if args.dry_run:
+        print("[DRY RUN] Analyzing what would be pushed to Gmail...")
+    else:
+        print("Pushing local filters to Gmail...")
 
     # Validate first
     validation = manager.validate()
@@ -187,15 +200,45 @@ def cmd_push(manager: FilterManager, args):
         for split in splits:
             print(f"  {split['name']}: {split['entries']} entries → {split['parts']} filter(s)")
 
-    if not args.force:
+    if not args.force and not args.dry_run:
         response = input("\nProceed with push? [y/N]: ")
         if response.lower() != "y":
             print("Aborted.")
             return 0
 
-    results = manager.push(apply_to_existing=not getattr(args, "no_apply_existing", False))
+    results = manager.push(
+        apply_to_existing=not getattr(args, "no_apply_existing", False),
+        verbose=getattr(args, "verbose", False),
+        dry_run=args.dry_run,
+    )
 
-    print(f"\nPushed {results['created']} filter(s), updated {results['updated']} filter(s)")
+    if args.dry_run:
+        print(
+            f"\n[DRY RUN] Would push {results['created']} filter(s), update {results['updated']} filter(s), skip {results.get('skipped', 0)} filter(s)"
+        )
+    else:
+        print(
+            f"\nPushed {results['created']} filter(s), updated {results['updated']} filter(s), skipped {results.get('skipped', 0)} filter(s)"
+        )
+
+    if results.get("split_filters"):
+        print("\nAuto-split filters:")
+        for name in results["split_filters"]:
+            print(f"  - {name}")
+
+    if results.get("applied_to_existing"):
+        print(f"\nApplied labels to {results['applied_to_existing']} existing conversation(s)")
+
+    return 0
+
+    results = manager.push(
+        apply_to_existing=not getattr(args, "no_apply_existing", False),
+        verbose=getattr(args, "verbose", False),
+    )
+
+    print(
+        f"\nPushed {results['created']} filter(s), updated {results['updated']} filter(s), skipped {results.get('skipped', 0)} filter(s)"
+    )
 
     if results.get("split_filters"):
         print("\nAuto-split filters:")

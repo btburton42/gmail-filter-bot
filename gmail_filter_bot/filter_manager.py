@@ -16,16 +16,22 @@ class FilterChange:
         name: The name of the filter
         local_only: Entries present locally but not remotely (would be added to Gmail on push)
         remote_only: Entries present remotely but not locally (would be added to local on sync)
+        action_changed: Whether the action has changed between local and remote
+        label_changed: Whether the label has changed between local and remote
     """
 
     name: str
     local_only: set[str] = field(default_factory=set)
     remote_only: set[str] = field(default_factory=set)
+    action_changed: bool = False
+    label_changed: bool = False
 
     @property
     def has_changes(self) -> bool:
         """Check if there are any differences between local and remote."""
-        return bool(self.local_only or self.remote_only)
+        return bool(
+            self.local_only or self.remote_only or self.action_changed or self.label_changed
+        )
 
     @property
     def added_to_remote(self) -> list[str]:
@@ -149,7 +155,7 @@ class FilterManager:
 
         return remote_entries
 
-    def detect_changes(self) -> list[FilterChange]:
+    def detect_changes(self, verbose: bool = False) -> list[FilterChange]:
         """Detect differences between local filters and Gmail.
 
         Compares local filter configurations with remote Gmail filters
@@ -163,6 +169,9 @@ class FilterManager:
         # Get remote filters once
         remote_filters = self.client.list_filters()
 
+        if verbose:
+            print(f"\n  [DEBUG] Found {len(remote_filters)} remote filter(s) in Gmail")
+
         # Compare each local filter with remote
         for name, local_filter in self.config.filters.items():
             local_entries = set(local_filter.entries)
@@ -171,10 +180,112 @@ class FilterManager:
             change = self.compare_filter_entries(local_entries, remote_entries)
             change.name = name
 
+            # Also check if action/label changed
+            remote_action, remote_label = self._get_remote_action_and_label(name, remote_filters)
+            if remote_action and local_filter.action != remote_action:
+                change.action_changed = True
+            if remote_label and local_filter.label != remote_label:
+                change.label_changed = True
+
             if change.has_changes:
+                if verbose:
+                    print(f"  [DEBUG] Filter '{name}' has changes:")
+                    print(
+                        f"    - Local entries: {len(local_entries)}, Remote entries: {len(remote_entries)}"
+                    )
+                    if change.local_only:
+                        print(
+                            f"    - Local only (would add): {list(change.local_only)[:3]}{'...' if len(change.local_only) > 3 else ''}"
+                        )
+                    if change.remote_only:
+                        print(
+                            f"    - Remote only (would remove): {list(change.remote_only)[:3]}{'...' if len(change.remote_only) > 3 else ''}"
+                        )
+                    if change.action_changed:
+                        print(
+                            f"    - Action changed: local='{local_filter.action}', remote='{remote_action}'"
+                        )
+                    if change.label_changed:
+                        print(
+                            f"    - Label changed: local='{local_filter.label}', remote='{remote_label}'"
+                        )
                 changes.append(change)
+            elif verbose:
+                print(f"  [DEBUG] Filter '{name}' - no changes ({len(local_entries)} entries)")
 
         return changes
+
+    def _get_remote_action_and_label(
+        self, name: str, remote_filters: list[dict]
+    ) -> tuple[str | None, str | None]:
+        """Extract action and label from remote filters matching a base name.
+
+        Args:
+            name: Base filter name to match
+            remote_filters: List of remote filter objects from Gmail API
+
+        Returns:
+            Tuple of (action, label) or (None, None) if no matching filters found
+        """
+        for rf in remote_filters:
+            base_name = self._match_filter_to_local(rf)
+            if base_name == name:
+                action = self._extract_remote_action(rf)
+                label = self._extract_remote_label(rf)
+                return action, label
+        return None, None
+
+    def _extract_remote_action(self, filter_obj: dict) -> str:
+        """Extract action type from a remote filter object."""
+        action_obj = filter_obj.get("action", {})
+        add_labels = set(action_obj.get("addLabelIds", []))
+        remove_labels = set(action_obj.get("removeLabelIds", []))
+
+        # Check for delete (moved to trash)
+        if "TRASH" in add_labels:
+            return "delete"
+
+        # Check for star
+        if "STARRED" in add_labels:
+            return "star"
+
+        # Check for important/not important
+        if "IMPORTANT" in add_labels:
+            return "mark_important"
+        if "IMPORTANT" in remove_labels:
+            return "mark_not_important"
+
+        # Check for archive (inbox removed)
+        inbox_removed = "INBOX" in remove_labels
+
+        # Check for custom labels
+        system_labels = {"INBOX", "STARRED", "IMPORTANT", "TRASH", "SPAM", "UNREAD"}
+        custom_labels = add_labels - system_labels
+
+        if custom_labels:
+            if inbox_removed:
+                return "label_and_archive"
+            else:
+                return "label_only"
+        elif inbox_removed:
+            return "archive"
+
+        return "label_only"  # Default
+
+    def _extract_remote_label(self, filter_obj: dict) -> str | None:
+        """Extract label name from a remote filter object."""
+        action_obj = filter_obj.get("action", {})
+        add_labels = set(action_obj.get("addLabelIds", []))
+
+        # Find first non-system label
+        system_labels = {"INBOX", "STARRED", "IMPORTANT", "TRASH", "SPAM", "UNREAD"}
+        custom_labels = add_labels - system_labels
+
+        if custom_labels:
+            label_id = custom_labels.pop()
+            return self.client.get_label_name(label_id)
+
+        return None
 
     def sync(self, dry_run: bool = False) -> list[FilterChange]:
         """Sync Gmail filters with local configuration.
@@ -205,11 +316,14 @@ class FilterManager:
 
         return changes
 
-    def push(self, apply_to_existing: bool = False) -> dict[str, Any]:
+    def push(
+        self, apply_to_existing: bool = False, verbose: bool = False, dry_run: bool = False
+    ) -> dict[str, Any]:
         """Push local filters to Gmail."""
         results: dict[str, Any] = {
             "created": 0,
             "updated": 0,
+            "skipped": 0,
             "split_filters": [],
             "applied_to_existing": 0,
         }
@@ -217,13 +331,53 @@ class FilterManager:
         # Get existing remote filters
         remote_filters = self.client.list_filters()
 
-        # Delete existing filters that match our base names
-        # (we'll recreate them properly)
-        base_names = set(self.config.filters.keys())
+        # Detect which filters have changes
+        changed_filters = self.detect_changes(verbose=verbose)
+        changed_names = {c.name for c in changed_filters}
+
+        # Build a set of filters that have ENTRY changes (not just action/label)
+        # These are the only ones that need "apply to existing"
+        entry_changes_names = {c.name for c in changed_filters if c.local_only or c.remote_only}
+
+        # Identify filters that need no changes
+        unchanged_names = set(self.config.filters.keys()) - changed_names
+
+        if dry_run:
+            # Just report what would happen
+            for name in changed_names:
+                filter_config = self.config.filters[name]
+                entries = filter_config.entries
+                entry_count = len(entries)
+
+                if len(entries) <= self.config.max_entries_per_filter:
+                    print(f"  [DRY RUN] Would update: {name} ({entry_count} entries)")
+                else:
+                    parts_count = (
+                        entry_count + self.config.max_entries_per_filter - 1
+                    ) // self.config.max_entries_per_filter
+                    print(
+                        f"  [DRY RUN] Would update: {name} ({entry_count} entries) → {parts_count} filters"
+                    )
+
+                if name in entry_changes_names and apply_to_existing and filter_config.label:
+                    print(
+                        f"    [DRY RUN] Would apply label '{filter_config.label}' to existing conversations"
+                    )
+
+            for name in unchanged_names:
+                entry_count = len(self.config.filters[name].entries)
+                print(f"  [DRY RUN] Would skip: {name} ({entry_count} entries) - no changes")
+
+            results["created"] = len(changed_names)
+            results["updated"] = len(changed_names)
+            results["skipped"] = len(unchanged_names)
+            return results
+
+        # Delete existing filters that match changed filters
         deleted_count = 0
         for rf in remote_filters:
             base_name = self._extract_base_name(rf)
-            if base_name in base_names:
+            if base_name in changed_names:
                 self.client.delete_filter(rf["id"])
                 results["updated"] += 1
                 deleted_count += 1
@@ -231,8 +385,9 @@ class FilterManager:
         if deleted_count > 0:
             print(f"  ✓ Deleted {deleted_count} existing filter(s)")
 
-        # Create new filters
-        for name, filter_config in self.config.filters.items():
+        # Create/replace changed filters
+        for name in changed_names:
+            filter_config = self.config.filters[name]
             entries = filter_config.entries
 
             if len(entries) <= self.config.max_entries_per_filter:
@@ -252,8 +407,9 @@ class FilterManager:
                 results["split_filters"].append(name)
                 print(f"  ✓ Split '{name}' into {len(parts)} part(s)")
 
-            # Apply labels to existing conversations if requested
-            if apply_to_existing and filter_config.label:
+            # Apply labels to existing conversations ONLY if entries changed
+            # (Action/label changes don't affect existing messages)
+            if apply_to_existing and name in entry_changes_names and filter_config.label:
                 print(f"  → Applying label '{filter_config.label}' to existing conversations...")
                 label_id = self.client._get_or_create_label(filter_config.label)
                 archive = filter_config.action in ["label_and_archive", "archive"]
@@ -263,6 +419,12 @@ class FilterManager:
                 results["applied_to_existing"] += modified_count
                 if modified_count > 0:
                     print(f"    ✓ Applied to {modified_count} conversation(s)")
+
+        # Report unchanged filters
+        for name in unchanged_names:
+            results["skipped"] += 1
+            entry_count = len(self.config.filters[name].entries)
+            print(f"  ⏭ Skipped filter: {name} ({entry_count} entries) - no changes")
 
         return results
 
@@ -314,23 +476,44 @@ class FilterManager:
         )
 
     def _extract_base_name(self, filter_obj: dict) -> str:
-        """Extract base filter name from remote filter."""
+        """Extract base filter name from remote filter.
+
+        Matches remote filters to local filters using action + label,
+        which is more reliable than entry matching when filters are scrambled.
+        """
+        # First try to match by action + label (more reliable)
+        remote_action = self._extract_remote_action(filter_obj)
+        remote_label = self._extract_remote_label(filter_obj)
+
+        for name, local_filter in self.config.filters.items():
+            if local_filter.action == remote_action and local_filter.label == remote_label:
+                return name
+
+        # Fallback to entry matching if action+label doesn't match
         entries = self.client.parse_filter_entries(filter_obj)
-        # Try to find matching local filter by entries
         for name, local_filter in self.config.filters.items():
             if any(entry in local_filter.entries for entry in entries):
                 return name
         return ""
 
     def _match_filter_to_local(self, filter_obj: dict) -> str:
-        """Match a remote filter to a local filter name."""
-        entries = self.client.parse_filter_entries(filter_obj)
+        """Match a remote filter to a local filter name.
 
+        Uses action + label matching first, then falls back to entry overlap.
+        """
+        # First try to match by action + label
+        remote_action = self._extract_remote_action(filter_obj)
+        remote_label = self._extract_remote_label(filter_obj)
+
+        for name, local_filter in self.config.filters.items():
+            if local_filter.action == remote_action and local_filter.label == remote_label:
+                return name
+
+        # Fallback to entry matching
+        entries = self.client.parse_filter_entries(filter_obj)
         for name, local_filter in self.config.filters.items():
             local_entries = set(local_filter.entries)
             remote_entries = set(entries)
-
-            # If they share any entries, consider it a match
             if local_entries & remote_entries:
                 return name
 
