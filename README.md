@@ -4,11 +4,11 @@ A Python CLI tool to sync and manage Gmail filters from a local YAML configurati
 
 ## Features
 
-- **Sync**: Pull current Gmail filters and merge with local configuration
-- **Push**: Apply local filters to Gmail (auto-splits if entry limits exceeded)
-- **Trim**: Remove duplicates and consolidate entries
-- **Validate**: Check configuration before pushing
+- **Simple 3-command workflow**: `init`, `apply`, `clean`
+- **Smart sync**: Auto-detects which direction changes need to go (Gmail → local, local → Gmail, or both)
+- **Part-level optimization**: Only updates changed parts of split filters (saves time on large filters)
 - **Auto-split**: Automatically creates "filter-name", "filter-name-2", etc. when entry count exceeds limits
+- **Dry-run support**: Preview all changes before applying
 
 ## Installation
 
@@ -101,42 +101,62 @@ Available actions:
 
 ### Commands
 
-| Command | Description | Flags |
-|---------|-------------|-------|
-| `init` | Import existing Gmail filters from your account into `filters.yaml`. Perfect if you already have filters set up in Gmail. | `--dry-run`: Preview without creating file<br>`--force`: Overwrite existing filters.yaml<br>`--format`: Consolidate similar filters after import |
-| `sync` | Pull current Gmail filters and merge any changes into your local `filters.yaml`. | `--dry-run`: Show changes without applying |
-| `push` | Apply your local `filters.yaml` configuration to Gmail. Auto-splits filters if entry limits are exceeded. **By default, labels are applied to existing conversations.** | `--force`: Skip confirmation prompt<br>`--no-apply-existing`: Don't apply labels to existing conversations |
-| `list` | Display all configured filters with their actions, labels, and entry counts. | `--show-entries`: Show all email addresses for each filter |
-| `trim` | Remove duplicate entries from all filters. | - |
-| `format` | Consolidate filters with the same action and label into single filters. | `--dry-run`: Preview changes without modifying |
-| `validate` | Check your `filters.yaml` configuration for errors before pushing. | - |
+| Command | Description | Common Flags |
+|---------|-------------|--------------|
+| `init` | Import existing Gmail filters from your account into `filters.yaml`. Run this first if you already have filters in Gmail. | `--dry-run`: Preview what would be imported |
+| `apply` | **Main command** - syncs changes between local config and Gmail. Auto-detects direction (pull from Gmail, push to Gmail, or both). | `--dry-run`: Preview changes<br>`--push`: Force push local → Gmail only<br>`--sync`: Force sync Gmail → local only<br>`--no-apply-existing`: Skip labeling existing conversations |
+| `clean` | Optimize your configuration by removing duplicates and consolidating similar filters. | `--dry-run`: Preview changes |
 
-**Note:** If you have pre-existing filters in Gmail, run `gmail-filter-bot init` to import them before using other commands.
-
-### Quick Examples
+### Quick Start
 
 ```bash
-# Import existing Gmail filters (run this first if you have filters)
+# 1. Import existing Gmail filters (one-time setup)
 gmail-filter-bot init
 
-# View your filters
-gmail-filter-bot list
-gmail-filter-bot list --show-entries  # Show all emails
+# 2. Apply changes (use this daily)
+gmail-filter-bot apply
 
-# Sync any changes from Gmail
-gmail-filter-bot sync
+# 3. Preview before applying
+gmail-filter-bot apply --dry-run
 
-# Push your filters to Gmail
-gmail-filter-bot push
+# 4. Optimize configuration (remove duplicates, consolidate)
+gmail-filter-bot clean
+```
 
-# Validate before pushing
-gmail-filter-bot validate
+### Detailed Examples
 
-# Clean up duplicates
-gmail-filter-bot trim
+**Initialize from Gmail:**
+```bash
+# Import your existing Gmail filters
+gmail-filter-bot init
 
-# Consolidate similar filters
-gmail-filter-bot format
+# Preview first (recommended)
+gmail-filter-bot init --dry-run
+```
+
+**Apply changes:**
+```bash
+# Auto-detect direction and sync
+gmail-filter-bot apply
+
+# Preview what would happen
+gmail-filter-bot apply --dry-run
+
+# Force specific direction
+gmail-filter-bot apply --push   # Only push local changes
+gmail-filter-bot apply --sync   # Only pull Gmail changes
+
+# Skip expensive "apply to existing" step
+gmail-filter-bot apply --no-apply-existing
+```
+
+**Clean up configuration:**
+```bash
+# Remove duplicates and consolidate
+gmail-filter-bot clean
+
+# Preview first
+gmail-filter-bot clean --dry-run
 ```
 
 ### Development Commands
@@ -160,6 +180,14 @@ If a filter has more than 50 entries:
 - Auto-created: `newsletters-2` (entries 51-100)
 - Auto-created: `newsletters-3` (entries 101-150)
 - etc.
+
+### Part-Level Optimization
+
+When you update a split filter (e.g., add one email to `newsletters`):
+- **Before**: Deletes and recreates ALL parts (e.g., 8 parts = 8 API calls)
+- **After**: Only updates the changed parts (e.g., 1 part = 1 API call)
+
+This saves significant time when applying labels to existing conversations for large filters.
 
 ## Google API Setup
 
@@ -226,5 +254,5 @@ echo "filters.yaml" >> .gitignore  # Already done
 vim filters.yaml
 
 # Run the tool
-python -m gmail_filter_bot push
+gmail-filter-bot apply
 ```

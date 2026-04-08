@@ -203,21 +203,27 @@ class TestDetectChanges:
 
     def test_no_changes_when_in_sync(self, filter_manager, mock_gmail_client):
         """Test that no changes are detected when local and remote are in sync."""
-        # Mock remote filters matching all local filters
+        # Mock remote filters matching all local filters (with correct action/label)
         mock_gmail_client.list_filters.return_value = [
             {
                 "id": "filter1",
                 "criteria": {"from": "a@example.com OR b@example.com OR c@example.com"},
+                "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
             },
             {
                 "id": "filter2",
                 "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
             },
         ]
         mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
             "filter1": ["a@example.com", "b@example.com", "c@example.com"],
             "filter2": ["news@site1.com", "news@site2.com"],
         }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
 
         changes = filter_manager.detect_changes()
 
@@ -518,3 +524,707 @@ class TestFormatFilters:
 
         assert list(mock_config.filters.keys()) == original_filters
         assert len(result["consolidated"]) == 1
+
+
+class TestRemoteActionExtraction:
+    """Tests for _extract_remote_action method."""
+
+    def test_extract_delete_action(self, filter_manager):
+        """Test detecting delete action from remote filter."""
+        remote_filter = {"action": {"addLabelIds": ["TRASH"], "removeLabelIds": ["INBOX"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "delete"
+
+    def test_extract_star_action(self, filter_manager):
+        """Test detecting star action from remote filter."""
+        remote_filter = {"action": {"addLabelIds": ["STARRED"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "star"
+
+    def test_extract_mark_important_action(self, filter_manager):
+        """Test detecting mark_important action from remote filter."""
+        remote_filter = {"action": {"addLabelIds": ["IMPORTANT"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "mark_important"
+
+    def test_extract_mark_not_important_action(self, filter_manager):
+        """Test detecting mark_not_important action from remote filter."""
+        remote_filter = {"action": {"removeLabelIds": ["IMPORTANT"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "mark_not_important"
+
+    def test_extract_archive_action(self, filter_manager):
+        """Test detecting archive action from remote filter."""
+        remote_filter = {"action": {"removeLabelIds": ["INBOX"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "archive"
+
+    def test_extract_label_only_action(self, filter_manager):
+        """Test detecting label_only action from remote filter."""
+        remote_filter = {"action": {"addLabelIds": ["Label_123"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "label_only"
+
+    def test_extract_label_and_archive_action(self, filter_manager):
+        """Test detecting label_and_archive action from remote filter."""
+        remote_filter = {"action": {"addLabelIds": ["Label_123"], "removeLabelIds": ["INBOX"]}}
+        action = filter_manager._extract_remote_action(remote_filter)
+        assert action == "label_and_archive"
+
+
+class TestRemoteLabelExtraction:
+    """Tests for _extract_remote_label method."""
+
+    def test_extract_custom_label(self, filter_manager, mock_gmail_client):
+        """Test extracting custom label name from remote filter."""
+        mock_gmail_client.get_label_name.return_value = "Work"
+        remote_filter = {"action": {"addLabelIds": ["Label_123"]}}
+        label = filter_manager._extract_remote_label(remote_filter)
+        assert label == "Work"
+        mock_gmail_client.get_label_name.assert_called_once_with("Label_123")
+
+    def test_extract_no_custom_label(self, filter_manager):
+        """Test extracting label when only system labels present."""
+        remote_filter = {"action": {"addLabelIds": ["INBOX", "STARRED"]}}
+        label = filter_manager._extract_remote_label(remote_filter)
+        assert label is None
+
+    def test_extract_no_labels(self, filter_manager):
+        """Test extracting label when no labels present."""
+        remote_filter = {"action": {}}
+        label = filter_manager._extract_remote_label(remote_filter)
+        assert label is None
+
+
+class TestActionLabelMatching:
+    """Tests for action+label based filter matching."""
+
+    def test_match_by_action_and_label(self, filter_manager, mock_gmail_client):
+        """Test matching remote filter to local by action+label."""
+        mock_gmail_client.get_label_name.return_value = "Work"
+        remote_filter = {
+            "id": "filter1",
+            "criteria": {"from": "x@example.com"},
+            "action": {"addLabelIds": ["Label_123"], "removeLabelIds": ["INBOX"]},
+        }
+        # Should match 'work' filter (label_and_archive, label='Work')
+        base_name = filter_manager._match_filter_to_local(remote_filter)
+        assert base_name == "work"
+
+    def test_match_by_entries_fallback(self, filter_manager, mock_gmail_client):
+        """Test fallback to entry matching when action+label doesn't match."""
+        # Action+label won't match, so it falls back to entry overlap
+        mock_gmail_client.parse_filter_entries.return_value = ["a@example.com", "z@example.com"]
+        remote_filter = {
+            "id": "filter1",
+            "criteria": {"from": "a@example.com OR z@example.com"},
+            "action": {"addLabelIds": ["Label_999"]},  # Different action/label
+        }
+        # Should still match 'work' by entry overlap (a@example.com)
+        base_name = filter_manager._match_filter_to_local(remote_filter)
+        assert base_name == "work"
+
+    def test_no_match_found(self, filter_manager, mock_gmail_client):
+        """Test when remote filter doesn't match any local filter."""
+        mock_gmail_client.get_label_name.return_value = "Unknown"
+        remote_filter = {
+            "id": "filter1",
+            "criteria": {"from": "unknown@example.com"},
+            "action": {"addLabelIds": ["Label_999"]},
+        }
+        base_name = filter_manager._match_filter_to_local(remote_filter)
+        assert base_name == ""
+
+
+class TestDetectSplitFilterChanges:
+    """Tests for detect_split_filter_changes method."""
+
+    def test_no_changes_in_split_filter(self, filter_manager, mock_gmail_client, mock_config):
+        """Test detecting no changes when split filter parts match."""
+        # Create a large filter that will be split
+        mock_config.filters["big_filter"] = FilterConfig(
+            name="big_filter",
+            action="label_only",
+            label="Big",
+            entries=[f"email{i}@example.com" for i in range(75)],  # 75 entries -> 2 parts
+        )
+
+        # Mock remote filters matching exactly
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": [f"email{i}@example.com" for i in range(50)],  # First 50
+            "filter2": [f"email{i}@example.com" for i in range(50, 75)],  # Remaining 25
+        }.get(f["id"], [])
+
+        mock_gmail_client.get_label_name.return_value = "Big"
+
+        remote_filters = [
+            {
+                "id": "filter1",
+                "criteria": {"from": " OR ".join([f"email{i}@example.com" for i in range(50)])},
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": " OR ".join([f"email{i}@example.com" for i in range(50, 75)])},
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+        ]
+
+        unchanged = filter_manager.detect_split_filter_changes("big_filter", remote_filters)
+
+        # Both parts should be unchanged
+        assert unchanged == {1, 2}
+
+    def test_partial_changes_in_split_filter(self, filter_manager, mock_gmail_client, mock_config):
+        """Test detecting which parts of split filter have changes."""
+        mock_config.filters["big_filter"] = FilterConfig(
+            name="big_filter",
+            action="label_only",
+            label="Big",
+            entries=[f"email{i}@example.com" for i in range(75)],
+        )
+
+        # Mock remote filters where only first part matches
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": [f"email{i}@example.com" for i in range(50)],  # Matches
+            "filter2": ["different@example.com"],  # Doesn't match
+        }.get(f["id"], [])
+
+        mock_gmail_client.get_label_name.return_value = "Big"
+
+        remote_filters = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "different@example.com"},
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+        ]
+
+        unchanged = filter_manager.detect_split_filter_changes("big_filter", remote_filters)
+
+        # Only first part unchanged
+        assert unchanged == {1}
+
+    def test_missing_remote_part(self, filter_manager, mock_gmail_client, mock_config):
+        """Test when remote part is missing entirely."""
+        mock_config.filters["big_filter"] = FilterConfig(
+            name="big_filter",
+            action="label_only",
+            label="Big",
+            entries=[f"email{i}@example.com" for i in range(75)],
+        )
+
+        # Only one remote filter (missing second part)
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": [f"email{i}@example.com" for i in range(50)],
+        }.get(f["id"], [])
+
+        mock_gmail_client.get_label_name.return_value = "Big"
+
+        remote_filters = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+        ]
+
+        unchanged = filter_manager.detect_split_filter_changes("big_filter", remote_filters)
+
+        # Only first part present and unchanged
+        assert unchanged == {1}
+
+    def test_action_change_in_part(self, filter_manager, mock_gmail_client, mock_config):
+        """Test detecting action change in a part."""
+        mock_config.filters["big_filter"] = FilterConfig(
+            name="big_filter",
+            action="label_only",  # Local action
+            label="Big",
+            entries=[f"email{i}@example.com" for i in range(75)],
+        )
+
+        # Remote has different action
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": [f"email{i}@example.com" for i in range(50)],
+            "filter2": [f"email{i}@example.com" for i in range(50, 75)],
+        }.get(f["id"], [])
+
+        mock_gmail_client.get_label_name.return_value = "Big"
+
+        remote_filters = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "..."},
+                "action": {
+                    "addLabelIds": ["Label_1"],
+                    "removeLabelIds": ["INBOX"],
+                },  # label_and_archive
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_1"]},  # label_only (matches)
+            },
+        ]
+
+        unchanged = filter_manager.detect_split_filter_changes("big_filter", remote_filters)
+
+        # Only second part unchanged (first has action change)
+        assert unchanged == {2}
+
+
+class TestPush:
+    """Tests for push method."""
+
+    def test_push_no_changes_skips_all(self, filter_manager, mock_gmail_client, mock_config):
+        """Test push skips all filters when no changes detected."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR b@example.com OR c@example.com"},
+                "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "b@example.com", "c@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+
+        results = filter_manager.push()
+
+        assert results["created"] == 0
+        assert results["updated"] == 0
+        assert results["skipped"] == 2
+        mock_gmail_client.delete_filter.assert_not_called()
+
+    def test_push_with_changes_deletes_and_creates(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test push deletes and recreates changed filters."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR b@example.com"},  # Missing c@example.com
+                "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "b@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+
+        results = filter_manager.push()
+
+        assert results["created"] == 1
+        assert results["updated"] == 1
+        assert results["skipped"] == 1  # newsletters unchanged
+        mock_gmail_client.delete_filter.assert_called_once_with("filter1")
+        mock_gmail_client.create_filter.assert_called_once()
+
+    def test_push_dry_run_no_changes(self, filter_manager, mock_gmail_client):
+        """Test dry run doesn't modify anything."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR b@example.com OR c@example.com"},
+                "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "b@example.com", "c@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+
+        results = filter_manager.push(dry_run=True)
+
+        mock_gmail_client.delete_filter.assert_not_called()
+        mock_gmail_client.create_filter.assert_not_called()
+        assert results["skipped"] == 2
+
+    def test_push_action_change_only_no_apply_existing(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test that action-only changes don't trigger apply to existing."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR b@example.com OR c@example.com"},
+                "action": {"addLabelIds": ["Label_1"]},  # label_only (local is label_and_archive)
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "b@example.com", "c@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+        mock_gmail_client.apply_label_to_existing.return_value = 0
+
+        results = filter_manager.push(apply_to_existing=True)
+
+        # Should NOT call apply_label_to_existing since only action changed
+        mock_gmail_client.apply_label_to_existing.assert_not_called()
+
+    def test_push_entry_change_triggers_apply_existing(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test that entry changes trigger apply to existing."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR b@example.com"},  # Missing c@example.com
+                "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "b@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+        mock_gmail_client._get_or_create_label.return_value = "Label_1"
+        mock_gmail_client.apply_label_to_existing.return_value = 10
+
+        results = filter_manager.push(apply_to_existing=True)
+
+        # Should call apply_label_to_existing since entries changed
+        mock_gmail_client.apply_label_to_existing.assert_called_once()
+
+
+class TestPushSplitFilters:
+    """Tests for push with split filters."""
+
+    def test_push_split_filter_partial_update(self, filter_manager, mock_gmail_client, mock_config):
+        """Test pushing split filter updates only changed parts."""
+        # Create a large filter that will be split
+        mock_config.filters["big_filter"] = FilterConfig(
+            name="big_filter",
+            action="label_only",
+            label="Big",
+            entries=[f"email{i}@example.com" for i in range(75)],  # 75 entries -> 2 parts
+        )
+
+        # Remote has work/newsletters matching, and big_filter parts
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter_work",
+                "criteria": {"from": "a@example.com OR b@example.com OR c@example.com"},
+                "action": {"addLabelIds": ["Label_Work"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter_news",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_News"]},
+            },
+            {
+                "id": "filter1",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_Big"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "different@example.com"},
+                "action": {"addLabelIds": ["Label_Big"]},
+            },
+        ]
+
+        def parse_side_effect(f):
+            entries_map = {
+                "filter_work": ["a@example.com", "b@example.com", "c@example.com"],
+                "filter_news": ["news@site1.com", "news@site2.com"],
+                "filter1": [f"email{i}@example.com" for i in range(50)],  # Matches
+                "filter2": ["different@example.com"],  # Different
+            }
+            return entries_map.get(f["id"], [])
+
+        mock_gmail_client.parse_filter_entries.side_effect = parse_side_effect
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_Work": "Work",
+            "Label_News": "Newsletters",
+            "Label_Big": "Big",
+        }.get(label_id, None)
+
+        results = filter_manager.push()
+
+        # Should skip work/newsletters, delete only the changed part (filter2), create big_filter part
+        assert results["skipped"] == 2  # work, newsletters
+        assert results["created"] == 1  # only big_filter-2
+        assert mock_gmail_client.delete_filter.call_count == 1  # only filter2
+        assert "big_filter" in results["split_filters"]
+
+    def test_push_split_filter_all_unchanged(self, filter_manager, mock_gmail_client, mock_config):
+        """Test pushing when all parts of split filter are unchanged."""
+        mock_config.filters["big_filter"] = FilterConfig(
+            name="big_filter",
+            action="label_only",
+            label="Big",
+            entries=[f"email{i}@example.com" for i in range(75)],
+        )
+
+        # Remote matches exactly for all filters
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter_work",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_Work"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter_news",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_News"]},
+            },
+            {
+                "id": "filter1",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_Big"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "..."},
+                "action": {"addLabelIds": ["Label_Big"]},
+            },
+        ]
+
+        def parse_side_effect(f):
+            entries_map = {
+                "filter_work": ["a@example.com", "b@example.com", "c@example.com"],
+                "filter_news": ["news@site1.com", "news@site2.com"],
+                "filter1": [f"email{i}@example.com" for i in range(50)],
+                "filter2": [f"email{i}@example.com" for i in range(50, 75)],
+            }
+            return entries_map.get(f["id"], [])
+
+        mock_gmail_client.parse_filter_entries.side_effect = parse_side_effect
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_Work": "Work",
+            "Label_News": "Newsletters",
+            "Label_Big": "Big",
+        }.get(label_id, None)
+
+        results = filter_manager.push()
+
+        # Should skip entirely
+        assert results["skipped"] == 3  # work, newsletters, big_filter
+        mock_gmail_client.delete_filter.assert_not_called()
+        mock_gmail_client.create_filter.assert_not_called()
+
+
+class TestPushEdgeCases:
+    """Tests for push edge cases."""
+
+    def test_push_empty_filter(self, filter_manager, mock_gmail_client, mock_config):
+        """Test pushing filter with no entries."""
+        mock_config.filters["empty"] = FilterConfig(
+            name="empty",
+            action="archive",
+            label=None,
+            entries=[],
+        )
+
+        # Empty remote - work/newsletters should be created, empty skipped (no entries)
+        mock_gmail_client.list_filters.return_value = []
+
+        results = filter_manager.push()
+
+        assert results["created"] == 2  # work, newsletters created; empty skipped (no entries)
+        assert results["skipped"] == 1  # empty skipped
+
+    def test_push_no_remote_filters(self, filter_manager, mock_gmail_client):
+        """Test pushing when Gmail has no filters."""
+        mock_gmail_client.list_filters.return_value = []
+
+        results = filter_manager.push()
+
+        assert results["created"] == 2
+        assert results["updated"] == 0
+        assert results["skipped"] == 0
+
+    def test_push_no_apply_existing_flag(self, filter_manager, mock_gmail_client, mock_config):
+        """Test that --no-apply-existing prevents apply_label_to_existing calls."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com"},
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Work",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+
+        results = filter_manager.push(apply_to_existing=False)
+
+        mock_gmail_client.apply_label_to_existing.assert_not_called()
+
+    def test_push_with_label_change_only(self, filter_manager, mock_gmail_client, mock_config):
+        """Test push when only label name changed."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR b@example.com OR c@example.com"},
+                "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site1.com OR news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "b@example.com", "c@example.com"],
+            "filter2": ["news@site1.com", "news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "OldWorkName",  # Different from "Work"
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+
+        results = filter_manager.push()
+
+        assert results["created"] == 1
+        assert results["updated"] == 1
+        assert results["skipped"] == 1  # newsletters unchanged
+
+
+class TestScrambledFilters:
+    """Tests for handling scrambled filters (entries in wrong filters)."""
+
+    def test_detect_scrambled_entries(self, filter_manager, mock_gmail_client, mock_config):
+        """Test detecting when remote has entries in wrong filter."""
+        # Simulate: remote 'newsletters' filter has entries that should be in 'work'
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com OR news@site1.com"},  # Mixed entries!
+                "action": {"addLabelIds": ["Label_1"]},
+            },
+            {
+                "id": "filter2",
+                "criteria": {"from": "news@site2.com"},
+                "action": {"addLabelIds": ["Label_2"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = lambda f: {
+            "filter1": ["a@example.com", "news@site1.com"],  # Has work entry
+            "filter2": ["news@site2.com"],
+        }.get(f["id"], [])
+        mock_gmail_client.get_label_name.side_effect = lambda label_id: {
+            "Label_1": "Newsletters",
+            "Label_2": "Newsletters",
+        }.get(label_id, None)
+
+        changes = filter_manager.detect_changes()
+
+        # Both filters should show as changed
+        assert len(changes) == 2
+        change_names = {c.name for c in changes}
+        assert change_names == {"work", "newsletters"}
+
+    def test_scrambled_filter_by_action_label_matching(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test that action+label matching correctly identifies scrambled filters."""
+        # Remote has wrong entries but correct label
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "wrong@entries.com"},
+                "action": {"addLabelIds": ["Label_Work"], "removeLabelIds": ["INBOX"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.return_value = ["wrong@entries.com"]
+        mock_gmail_client.get_label_name.return_value = "Work"
+
+        # Should match by label despite wrong entries
+        base_name = filter_manager._match_filter_to_local(
+            {
+                "id": "filter1",
+                "criteria": {"from": "wrong@entries.com"},
+                "action": {"addLabelIds": ["Label_Work"], "removeLabelIds": ["INBOX"]},
+            }
+        )
+
+        assert base_name == "work"
+
+    def test_get_remote_action_and_label(self, filter_manager, mock_gmail_client, mock_config):
+        """Test _get_remote_action_and_label helper."""
+        mock_gmail_client.list_filters.return_value = [
+            {
+                "id": "filter1",
+                "criteria": {"from": "a@example.com"},
+                "action": {"addLabelIds": ["Label_Work"], "removeLabelIds": ["INBOX"]},
+            },
+        ]
+        mock_gmail_client.parse_filter_entries.return_value = ["a@example.com"]
+        mock_gmail_client.get_label_name.return_value = "Work"
+
+        remote_filters = mock_gmail_client.list_filters.return_value
+        action, label = filter_manager._get_remote_action_and_label("work", remote_filters)
+
+        assert action == "label_and_archive"
+        assert label == "Work"
+
+    def test_get_remote_action_and_label_no_match(self, filter_manager, mock_gmail_client):
+        """Test _get_remote_action_and_label when no remote filter matches."""
+        mock_gmail_client.list_filters.return_value = []
+
+        action, label = filter_manager._get_remote_action_and_label("work", [])
+
+        assert action is None
+        assert label is None

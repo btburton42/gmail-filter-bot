@@ -5,14 +5,22 @@ import sys
 from pathlib import Path
 
 from .config import Config, Credentials
-from .filter_manager import FilterManager
+from .filter_manager import FilterChange, FilterManager
 from .gmail_client import GmailClient
 
 
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Sync and manage Gmail filters from YAML configuration"
+        description="Sync and manage Gmail filters from YAML configuration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  gmail-filter-bot init              # Import existing Gmail filters
+  gmail-filter-bot apply             # Sync changes (auto-detects direction)
+  gmail-filter-bot apply --dry-run   # Preview what would change
+  gmail-filter-bot clean             # Remove duplicates and optimize config
+        """,
     )
     parser.add_argument(
         "--config",
@@ -29,74 +37,58 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # sync command
-    sync_parser = subparsers.add_parser("sync", help="Sync Gmail filters with local config")
-    sync_parser.add_argument(
+    # init command
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Import existing Gmail filters into local config",
+        description="Create filters.yaml from your existing Gmail filters.",
+    )
+    init_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be imported",
+    )
+
+    # apply command - the main workflow
+    apply_parser = subparsers.add_parser(
+        "apply",
+        help="Apply configuration changes (sync, push, or both)",
+        description="""Apply changes between local config and Gmail.
+
+By default, this performs a two-way sync:
+  - Pulls new/deleted entries from Gmail
+  - Pushes local changes to Gmail
+
+Use --push or --sync to force a specific direction.""",
+    )
+    apply_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would change without applying",
     )
-
-    # push command
-    push_parser = subparsers.add_parser("push", help="Push local filters to Gmail")
-    push_parser.add_argument(
-        "--force",
+    apply_parser.add_argument(
+        "--push",
         action="store_true",
-        help="Skip confirmation prompt",
+        help="Force push local → Gmail (skip Gmail → local sync)",
     )
-    push_parser.add_argument(
+    apply_parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Force sync Gmail → local (skip local → Gmail push)",
+    )
+    apply_parser.add_argument(
         "--no-apply-existing",
         action="store_true",
-        help="Don't apply labels to existing conversations (default: labels are applied to existing messages)",
-    )
-    push_parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show detailed comparison info for debugging",
-    )
-    push_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be pushed without making changes",
+        help="Skip applying labels to existing conversations",
     )
 
-    # trim command
-    subparsers.add_parser("trim", help="Remove duplicates and consolidate entries")
-
-    # validate command
-    subparsers.add_parser("validate", help="Validate configuration")
-
-    # list command
-    list_parser = subparsers.add_parser("list", help="List all filters with their details")
-    list_parser.add_argument(
-        "--show-entries",
-        action="store_true",
-        help="Show all entries for each filter (default: only show count)",
+    # clean command
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Optimize configuration (remove duplicates, consolidate filters)",
+        description="Clean up filters.yaml by removing duplicates and consolidating similar filters.",
     )
-
-    # init command
-    init_parser = subparsers.add_parser(
-        "init", help="Import existing Gmail filters into local config"
-    )
-    init_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be imported without creating filters.yaml",
-    )
-    init_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing filters.yaml if it exists",
-    )
-    init_parser.add_argument(
-        "--format",
-        action="store_true",
-        help="Consolidate entries with similar filters after import",
-    )
-
-    # format command
-    format_parser = subparsers.add_parser("format", help="Consolidate entries with similar filters")
-    format_parser.add_argument(
+    clean_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would change without modifying filters.yaml",
@@ -111,7 +103,6 @@ def main():
     try:
         # Handle init command separately - it doesn't need existing config
         if args.command == "init":
-            # Load credentials only (not the filters config)
             credentials = Credentials.from_env_file(args.credentials)
             client = GmailClient(credentials)
             return cmd_init(credentials, client, args)
@@ -125,18 +116,10 @@ def main():
         # Initialize filter manager
         manager = FilterManager(config, client, args.config)
 
-        if args.command == "sync":
-            return cmd_sync(manager, args)
-        elif args.command == "push":
-            return cmd_push(manager, args)
-        elif args.command == "trim":
-            return cmd_trim(manager, args)
-        elif args.command == "validate":
-            return cmd_validate(manager, args)
-        elif args.command == "format":
-            return cmd_format(manager, args)
-        elif args.command == "list":
-            return cmd_list(manager, args)
+        if args.command == "apply":
+            return cmd_apply(manager, args)
+        elif args.command == "clean":
+            return cmd_clean(manager, args)
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -151,158 +134,14 @@ def main():
     return 0
 
 
-def cmd_sync(manager: FilterManager, args):
-    """Handle sync command."""
-    print("Syncing Gmail filters...")
-
-    changes = manager.sync(dry_run=args.dry_run)
-
-    if args.dry_run:
-        print("\n[DRY RUN] The following changes would be made:")
-
-    if not changes:
-        print("\nNo changes needed. Local filters are in sync with Gmail.")
-        return 0
-
-    print(f"\nFound {len(changes)} filter(s) with differences:")
-    for change in changes:
-        print(f"\n  {change.name}:")
-        if change.added_to_remote:
-            print(f"    + {len(change.added_to_remote)} new entries (from Gmail)")
-        if change.removed_from_remote:
-            print(f"    - {len(change.removed_from_remote)} removed entries (from Gmail)")
-
-    if not args.dry_run:
-        print("\nLocal filters.yaml has been updated with Gmail changes.")
-
-    return 0
-
-
-def cmd_push(manager: FilterManager, args):
-    """Handle push command."""
-    if args.dry_run:
-        print("[DRY RUN] Analyzing what would be pushed to Gmail...")
-    else:
-        print("Pushing local filters to Gmail...")
-
-    # Validate first
-    validation = manager.validate()
-    if not validation["valid"]:
-        print("\nValidation errors:")
-        for error in validation["errors"]:
-            print(f"  - {error}")
-        return 1
-
-    # Check for filters that need splitting
-    splits = validation.get("splits", [])
-    if splits:
-        print("\nThe following filters will be auto-split:")
-        for split in splits:
-            print(f"  {split['name']}: {split['entries']} entries → {split['parts']} filter(s)")
-
-    if not args.force and not args.dry_run:
-        response = input("\nProceed with push? [y/N]: ")
-        if response.lower() != "y":
-            print("Aborted.")
-            return 0
-
-    results = manager.push(
-        apply_to_existing=not getattr(args, "no_apply_existing", False),
-        verbose=getattr(args, "verbose", False),
-        dry_run=args.dry_run,
-    )
-
-    if args.dry_run:
-        print(
-            f"\n[DRY RUN] Would push {results['created']} filter(s), update {results['updated']} filter(s), skip {results.get('skipped', 0)} filter(s)"
-        )
-    else:
-        print(
-            f"\nPushed {results['created']} filter(s), updated {results['updated']} filter(s), skipped {results.get('skipped', 0)} filter(s)"
-        )
-
-    if results.get("split_filters"):
-        print("\nAuto-split filters:")
-        for name in results["split_filters"]:
-            print(f"  - {name}")
-
-    if results.get("applied_to_existing"):
-        print(f"\nApplied labels to {results['applied_to_existing']} existing conversation(s)")
-
-    return 0
-
-    results = manager.push(
-        apply_to_existing=not getattr(args, "no_apply_existing", False),
-        verbose=getattr(args, "verbose", False),
-    )
-
-    print(
-        f"\nPushed {results['created']} filter(s), updated {results['updated']} filter(s), skipped {results.get('skipped', 0)} filter(s)"
-    )
-
-    if results.get("split_filters"):
-        print("\nAuto-split filters:")
-        for name in results["split_filters"]:
-            print(f"  - {name}")
-
-    if results.get("applied_to_existing"):
-        print(f"\nApplied labels to {results['applied_to_existing']} existing conversation(s)")
-
-    return 0
-
-
-def cmd_trim(manager: FilterManager, args):
-    """Handle trim command."""
-    print("Trimming duplicates and consolidating entries...")
-
-    results = manager.trim()
-
-    if results["duplicates"] == 0:
-        print("\nNo duplicates found.")
-    else:
-        print(
-            f"\nRemoved {results['duplicates']} duplicate entries from {len(results['filters'])} filter(s)"
-        )
-        for name in results["filters"]:
-            print(f"  - {name}")
-
-    return 0
-
-
-def cmd_validate(manager: FilterManager, args):
-    """Handle validate command."""
-    print("Validating configuration...")
-
-    validation = manager.validate()
-
-    if validation["valid"]:
-        print("\nConfiguration is valid!")
-        print(f"  - {validation['total_filters']} filter(s)")
-        print(f"  - {validation['total_entries']} total entries")
-
-        if validation.get("splits"):
-            print("\nFilters requiring auto-split:")
-            for split in validation["splits"]:
-                print(f"  - {split['name']}: {split['entries']} entries → {split['parts']} part(s)")
-
-        return 0
-    else:
-        print("\nValidation errors:")
-        for error in validation["errors"]:
-            print(f"  - {error}")
-        return 1
-
-
 def cmd_init(credentials, client, args):
     """Handle init command - import existing Gmail filters."""
-    from .config import Config, FilterConfig
-
     config_path = args.config
 
     # Check if filters.yaml already exists
-    if config_path.exists() and not args.dry_run and not args.force:
+    if config_path.exists() and not args.dry_run:
         print(f"Error: {config_path} already exists.")
-        print("Use --force to overwrite or --dry-run to preview.")
+        print("Delete it first or use a different --config path.")
         return 1
 
     print("Importing existing Gmail filters...")
@@ -317,6 +156,8 @@ def cmd_init(credentials, client, args):
     print(f"\nFound {len(remote_filters)} filter(s) in Gmail.")
 
     # Group filters by their action type and label
+    from .config import FilterConfig
+
     imported_filters = {}
 
     for rf in remote_filters:
@@ -401,24 +242,8 @@ def cmd_init(credentials, client, args):
 
     print(f"\nTotal entries imported: {sum(len(f.entries) for f in new_config.filters.values())}")
 
-    # Format/consolidate if requested
-    if getattr(args, "format", False):
-        print("\nConsolidating similar filters...")
-        # Create temporary manager to format the new config
-        temp_manager = FilterManager(new_config, client, config_path)
-        format_results = temp_manager.format_filters(dry_run=False)
-
-        if format_results["consolidated"]:
-            print(f"Consolidated {len(format_results['consolidated'])} filter group(s):")
-            for group in format_results["consolidated"]:
-                print(
-                    f"  - {group['name']}: combined {group['source_count']} filters into {group['total_entries']} entries"
-                )
-        else:
-            print("No filters needed consolidation.")
-
     print(f"\nEdit {config_path} to customize filter names and actions.")
-    print(f"Then run: gmail-filter-bot push")
+    print(f"Then run: gmail-filter-bot apply")
 
     return 0
 
@@ -469,75 +294,171 @@ def _classify_action(add_labels, remove_labels, client=None):
     return action, label
 
 
-def cmd_format(manager, args):
-    """Handle format command - consolidate entries with similar filters."""
-    print("Consolidating entries with similar filters...")
+def cmd_apply(manager: FilterManager, args):
+    """Handle apply command - smart two-way sync."""
+    dry_run = args.dry_run
+    force_push = args.push
+    force_sync = args.sync
+    no_apply_existing = args.no_apply_existing
 
-    results = manager.format_filters(dry_run=args.dry_run)
+    # Validate first
+    print("Validating configuration...")
+    validation = manager.validate()
+    if not validation["valid"]:
+        print("\nValidation errors:")
+        for error in validation["errors"]:
+            print(f"  - {error}")
+        return 1
 
-    if args.dry_run:
-        print("\n[DRY RUN] The following changes would be made:")
+    print(f"  ✓ {validation['total_filters']} filter(s), {validation['total_entries']} entries")
 
-    if not results["consolidated"]:
-        print("\nNo similar filters found to consolidate.")
+    if validation.get("splits"):
+        print("\nFilters requiring auto-split:")
+        for split in validation["splits"]:
+            print(f"  - {split['name']}: {split['entries']} entries → {split['parts']} parts")
+
+    # Detect changes
+    print("\nAnalyzing changes...")
+    changes = manager.detect_changes()
+
+    # Classify changes
+    push_changes = [
+        c for c in changes if c.has_entry_changes or c.action_changed or c.label_changed
+    ]
+    sync_changes = [c for c in changes if c.has_entry_changes]
+
+    # Determine operation mode
+    if force_push and force_sync:
+        print("Error: Cannot use both --push and --sync")
+        return 1
+
+    if force_push:
+        mode = "push"
+    elif force_sync:
+        mode = "sync"
+    else:
+        # Auto-detect: if there are remote-only changes, suggest sync
+        has_remote_changes = any(c.remote_only for c in changes)
+        has_local_changes = any(
+            c.local_only or c.action_changed or c.label_changed for c in changes
+        )
+
+        if has_remote_changes and has_local_changes:
+            mode = "both"
+        elif has_remote_changes:
+            mode = "sync"
+        else:
+            mode = "push"
+
+    if dry_run:
+        print(f"\n[DRY RUN] Mode: {mode}")
+
+    # Show changes
+    if not changes:
+        print("\nNo changes detected. Everything is in sync!")
         return 0
 
-    print(f"\nConsolidated {len(results['consolidated'])} filter group(s):")
+    print(f"\nDetected {len(changes)} filter(s) with changes:")
+    for change in changes:
+        print(f"\n  {change.name}:")
+        if change.local_only:
+            print(f"    + {len(change.local_only)} entries (local only)")
+        if change.remote_only:
+            print(f"    - {len(change.remote_only)} entries (remote only)")
+        if change.action_changed:
+            print(f"    ~ action changed")
+        if change.label_changed:
+            print(f"    ~ label changed")
 
-    for group in results["consolidated"]:
-        print(f"\n  {group['name']}:")
-        print(f"    Combined {group['source_count']} filter(s) with same action/label")
-        print(f"    Total entries: {group['total_entries']}")
-        if group.get("removed_filters"):
-            print(f"    Removed: {', '.join(group['removed_filters'])}")
+    if dry_run:
+        print("\n[DRY RUN] No changes made.")
+        return 0
 
-    if not args.dry_run:
-        print(f"\nfilters.yaml has been updated.")
+    # Confirm before applying
+    if mode == "both":
+        print("\nWarning: Changes detected in both directions!")
+        print("  - Some entries exist only in Gmail (will be pulled)")
+        print("  - Some entries exist only locally (will be pushed)")
+
+    response = input(f"\nApply {mode} changes? [y/N]: ")
+    if response.lower() != "y":
+        print("Aborted.")
+        return 0
+
+    # Execute operations
+    results = {"synced": 0, "pushed": 0, "skipped": 0}
+
+    if mode in ("sync", "both") and sync_changes:
+        print("\nSyncing Gmail → local...")
+        for change in sync_changes:
+            # Get remote entries for this filter
+            remote_filters = manager.client.list_filters()
+            remote_entries = manager.get_remote_filter_entries(change.name, remote_filters)
+
+            # Update local filter with remote entries
+            manager.config.filters[change.name].entries = sorted(remote_entries)
+            results["synced"] += 1
+            print(f"  ✓ Synced {change.name}")
+
+        # Save updated configuration
+        manager.config.save(manager.config_path)
+
+    if mode in ("push", "both") and push_changes:
+        print("\nPushing local → Gmail...")
+        push_results = manager.push(
+            apply_to_existing=not no_apply_existing,
+            verbose=False,
+            dry_run=False,
+        )
+        results["pushed"] = push_results["created"]
+        results["skipped"] = push_results["skipped"]
+
+    # Summary
+    print(f"\n{'=' * 50}")
+    print("Summary:")
+    if results["synced"]:
+        print(f"  Synced: {results['synced']} filter(s) from Gmail")
+    if results["pushed"]:
+        print(f"  Pushed: {results['pushed']} filter(s) to Gmail")
+    if results["skipped"]:
+        print(f"  Skipped: {results['skipped']} filter(s) (no changes)")
 
     return 0
 
 
-def cmd_list(manager, args):
-    """Handle list command - display all filters with details."""
-    print("Gmail Filters\n")
-    print("=" * 60)
+def cmd_clean(manager: FilterManager, args):
+    """Handle clean command - trim duplicates and format filters."""
+    dry_run = args.dry_run
 
-    if not manager.config.filters:
-        print("\nNo filters configured.")
-        return 0
+    print("Cleaning configuration...")
 
-    # Sort filters by name for consistent display
-    sorted_filters = sorted(manager.config.filters.items())
+    # Step 1: Trim duplicates
+    print("\n  Step 1: Removing duplicates...")
+    trim_results = manager.trim()
 
-    for name, filter_config in sorted_filters:
-        print(f"\n📁 {name}")
-        print("-" * 40)
+    if trim_results["duplicates"] == 0:
+        print("    ✓ No duplicates found")
+    else:
+        print(
+            f"    ✓ Removed {trim_results['duplicates']} duplicates from {len(trim_results['filters'])} filter(s)"
+        )
+        for name in trim_results["filters"]:
+            print(f"      - {name}")
 
-        # Display action in human-readable format
-        action_display = filter_config.action.replace("_", " ").title()
-        print(f"  Action: {action_display}")
+    # Step 2: Consolidate similar filters
+    print("\n  Step 2: Consolidating similar filters...")
+    format_results = manager.format_filters(dry_run=dry_run)
 
-        # Display label if present
-        if filter_config.label:
-            print(f"  Label: {filter_config.label}")
+    if not format_results["consolidated"]:
+        print("    ✓ No filters to consolidate")
+    else:
+        print(f"    ✓ Consolidated {len(format_results['consolidated'])} filter group(s):")
+        for group in format_results["consolidated"]:
+            print(f"      - {group['name']}: {group['total_entries']} entries")
 
-        # Display entry count
-        entry_count = len(filter_config.entries)
-        print(f"  Entries: {entry_count}")
-
-        # Show entries if requested
-        if args.show_entries and filter_config.entries:
-            print("  Emails:")
-            for entry in filter_config.entries:
-                print(f"    • {entry}")
-        elif args.show_entries:
-            print("  Emails: (none)")
-
-    print("\n" + "=" * 60)
-    total_filters = len(manager.config.filters)
-    total_entries = sum(len(f.entries) for f in manager.config.filters.values())
-    print(
-        f"\nTotal: {total_filters} filter(s), {total_entries} entr{'y' if total_entries == 1 else 'ies'}"
-    )
+    if dry_run:
+        print("\n[DRY RUN] No changes saved.")
+    else:
+        print(f"\nConfiguration saved to {manager.config_path}")
 
     return 0

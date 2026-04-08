@@ -18,6 +18,7 @@ class FilterChange:
         remote_only: Entries present remotely but not locally (would be added to local on sync)
         action_changed: Whether the action has changed between local and remote
         label_changed: Whether the label has changed between local and remote
+        unchanged_parts: Set of part indices that don't need updating (for split filters)
     """
 
     name: str
@@ -25,6 +26,7 @@ class FilterChange:
     remote_only: set[str] = field(default_factory=set)
     action_changed: bool = False
     label_changed: bool = False
+    unchanged_parts: set[int] = field(default_factory=set)
 
     @property
     def has_changes(self) -> bool:
@@ -32,6 +34,11 @@ class FilterChange:
         return bool(
             self.local_only or self.remote_only or self.action_changed or self.label_changed
         )
+
+    @property
+    def has_entry_changes(self) -> bool:
+        """Check if there are entry-level changes (not just action/label)."""
+        return bool(self.local_only or self.remote_only)
 
     @property
     def added_to_remote(self) -> list[str]:
@@ -188,6 +195,13 @@ class FilterManager:
                 change.label_changed = True
 
             if change.has_changes:
+                # For split filters, check which specific parts are unchanged
+                entry_count = len(local_filter.entries)
+                if entry_count > self.config.max_entries_per_filter:
+                    change.unchanged_parts = self.detect_split_filter_changes(
+                        name, remote_filters, verbose
+                    )
+
                 if verbose:
                     print(f"  [DEBUG] Filter '{name}' has changes:")
                     print(
@@ -209,6 +223,11 @@ class FilterManager:
                         print(
                             f"    - Label changed: local='{local_filter.label}', remote='{remote_label}'"
                         )
+                    if change.unchanged_parts:
+                        total_parts = (
+                            entry_count + self.config.max_entries_per_filter - 1
+                        ) // self.config.max_entries_per_filter
+                        print(f"    - Unchanged parts: {change.unchanged_parts} of {total_parts}")
                 changes.append(change)
             elif verbose:
                 print(f"  [DEBUG] Filter '{name}' - no changes ({len(local_entries)} entries)")
@@ -287,6 +306,95 @@ class FilterManager:
 
         return None
 
+    def detect_split_filter_changes(
+        self, name: str, remote_filters: list[dict], verbose: bool = False
+    ) -> set[int]:
+        """Detect which parts of a split filter have changes.
+
+        For split filters (e.g., newsletters-1, newsletters-2), compares each
+        remote part to its corresponding local part to identify unchanged
+        parts that can be skipped during push.
+
+        Args:
+            name: Base filter name
+            remote_filters: List of remote filter objects from Gmail API
+            verbose: Whether to print debug info
+
+        Returns:
+            Set of part indices (1-based) that are unchanged and can be skipped
+        """
+        filter_config = self.config.filters[name]
+        entries = filter_config.entries
+        max_per_filter = self.config.max_entries_per_filter
+
+        # Split local entries into parts
+        local_parts = self._split_entries(entries, max_per_filter)
+
+        unchanged_parts: set[int] = set()
+
+        # Group remote filters by part name
+        remote_by_part: dict[str, dict] = {}
+        for rf in remote_filters:
+            base_name = self._match_filter_to_local(rf)
+            if base_name == name:
+                # Extract part name from the remote filter
+                rf_entries = self.client.parse_filter_entries(rf)
+                # Try to match to a part by entry overlap
+                for i, local_part in enumerate(local_parts, 1):
+                    part_name = name if i == 1 else f"{name}-{i}"
+                    local_part_set = set(local_part)
+                    remote_part_set = set(rf_entries)
+                    # If they share entries, this is that part
+                    if local_part_set & remote_part_set:
+                        remote_by_part[part_name] = rf
+                        break
+
+        # Compare each local part to its remote counterpart
+        for i, local_part in enumerate(local_parts, 1):
+            part_name = name if i == 1 else f"{name}-{i}"
+            local_part_set = set(local_part)
+
+            if part_name in remote_by_part:
+                rf = remote_by_part[part_name]
+                remote_entries = set(self.client.parse_filter_entries(rf))
+
+                # Check if action/label matches
+                remote_action = self._extract_remote_action(rf)
+                remote_label = self._extract_remote_label(rf)
+                action_match = filter_config.action == remote_action
+                label_match = filter_config.label == remote_label
+
+                # Check if entries match exactly
+                entries_match = local_part_set == remote_entries
+
+                if entries_match and action_match and label_match:
+                    unchanged_parts.add(i)
+                    if verbose:
+                        print(
+                            f"    [DEBUG] Part '{part_name}' unchanged ({len(local_part)} entries)"
+                        )
+                elif verbose:
+                    if not entries_match:
+                        local_only = local_part_set - remote_entries
+                        remote_only = remote_entries - local_part_set
+                        print(f"    [DEBUG] Part '{part_name}' has entry changes:")
+                        if local_only:
+                            print(f"      + {len(local_only)} entries to add")
+                        if remote_only:
+                            print(f"      - {len(remote_only)} entries to remove")
+                    if not action_match:
+                        print(
+                            f"      Action differs: local='{filter_config.action}', remote='{remote_action}'"
+                        )
+                    if not label_match:
+                        print(
+                            f"      Label differs: local='{filter_config.label}', remote='{remote_label}'"
+                        )
+            elif verbose:
+                print(f"    [DEBUG] Part '{part_name}' not found remotely (new)")
+
+        return unchanged_parts
+
     def sync(self, dry_run: bool = False) -> list[FilterChange]:
         """Sync Gmail filters with local configuration.
 
@@ -342,22 +450,44 @@ class FilterManager:
         # Identify filters that need no changes
         unchanged_names = set(self.config.filters.keys()) - changed_names
 
+        # Build lookup for change details
+        changes_by_name = {c.name: c for c in changed_filters}
+
         if dry_run:
             # Just report what would happen
             for name in changed_names:
                 filter_config = self.config.filters[name]
                 entries = filter_config.entries
                 entry_count = len(entries)
+                change = changes_by_name[name]
 
                 if len(entries) <= self.config.max_entries_per_filter:
                     print(f"  [DRY RUN] Would update: {name} ({entry_count} entries)")
                 else:
-                    parts_count = (
-                        entry_count + self.config.max_entries_per_filter - 1
-                    ) // self.config.max_entries_per_filter
-                    print(
-                        f"  [DRY RUN] Would update: {name} ({entry_count} entries) → {parts_count} filters"
-                    )
+                    parts = self._split_entries(entries, self.config.max_entries_per_filter)
+                    total_parts = len(parts)
+                    unchanged = change.unchanged_parts
+                    changed_part_count = total_parts - len(unchanged)
+
+                    if unchanged:
+                        print(
+                            f"  [DRY RUN] Would update: {name} ({entry_count} entries) "
+                            f"→ {changed_part_count}/{total_parts} parts changed"
+                        )
+                        for i in range(1, total_parts + 1):
+                            part_name = name if i == 1 else f"{name}-{i}"
+                            if i in unchanged:
+                                print(f"    [DRY RUN] Would skip: {part_name} - no changes")
+                            else:
+                                part_entries = parts[i - 1]
+                                print(
+                                    f"    [DRY RUN] Would update: {part_name} ({len(part_entries)} entries)"
+                                )
+                    else:
+                        print(
+                            f"  [DRY RUN] Would update: {name} ({entry_count} entries) "
+                            f"→ {total_parts} filters"
+                        )
 
                 if name in entry_changes_names and apply_to_existing and filter_config.label:
                     print(
@@ -373,14 +503,44 @@ class FilterManager:
             results["skipped"] = len(unchanged_names)
             return results
 
-        # Delete existing filters that match changed filters
+        # Delete existing filters that match changed filters (but only changed parts for split filters)
         deleted_count = 0
+        deleted_filter_ids: set[str] = set()
+
         for rf in remote_filters:
             base_name = self._extract_base_name(rf)
             if base_name in changed_names:
-                self.client.delete_filter(rf["id"])
-                results["updated"] += 1
-                deleted_count += 1
+                change = changes_by_name[base_name]
+                filter_config = self.config.filters[base_name]
+
+                # For non-split filters, delete all
+                if len(filter_config.entries) <= self.config.max_entries_per_filter:
+                    if rf["id"] not in deleted_filter_ids:
+                        self.client.delete_filter(rf["id"])
+                        deleted_filter_ids.add(rf["id"])
+                        results["updated"] += 1
+                        deleted_count += 1
+                else:
+                    # For split filters, check if this specific part is unchanged
+                    rf_entries = set(self.client.parse_filter_entries(rf))
+                    parts = self._split_entries(
+                        filter_config.entries, self.config.max_entries_per_filter
+                    )
+
+                    # Find which part this is
+                    part_index = None
+                    for i, local_part in enumerate(parts, 1):
+                        if set(local_part) & rf_entries:
+                            part_index = i
+                            break
+
+                    # Delete only if this part changed
+                    if part_index not in change.unchanged_parts:
+                        if rf["id"] not in deleted_filter_ids:
+                            self.client.delete_filter(rf["id"])
+                            deleted_filter_ids.add(rf["id"])
+                            results["updated"] += 1
+                            deleted_count += 1
 
         if deleted_count > 0:
             print(f"  ✓ Deleted {deleted_count} existing filter(s)")
@@ -389,6 +549,7 @@ class FilterManager:
         for name in changed_names:
             filter_config = self.config.filters[name]
             entries = filter_config.entries
+            change = changes_by_name[name]
 
             if len(entries) <= self.config.max_entries_per_filter:
                 # Create single filter
@@ -398,14 +559,26 @@ class FilterManager:
             else:
                 # Split into multiple filters
                 parts = self._split_entries(entries, self.config.max_entries_per_filter)
+                total_parts = len(parts)
+                unchanged = change.unchanged_parts
+                created_parts = 0
+
                 for i, part_entries in enumerate(parts, 1):
+                    if i in unchanged:
+                        continue  # Skip unchanged parts
+
                     part_name = name if i == 1 else f"{name}-{i}"
                     self._create_filter_with_entries(part_name, filter_config, part_entries)
                     results["created"] += 1
+                    created_parts += 1
                     print(f"  ✓ Created filter: {part_name} ({len(part_entries)} entries)")
 
+                if unchanged:
+                    print(f"  ✓ Updated {name}: {created_parts}/{total_parts} parts changed")
+                else:
+                    print(f"  ✓ Split '{name}' into {total_parts} part(s)")
+
                 results["split_filters"].append(name)
-                print(f"  ✓ Split '{name}' into {len(parts)} part(s)")
 
             # Apply labels to existing conversations ONLY if entries changed
             # (Action/label changes don't affect existing messages)
