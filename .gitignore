@@ -1,7 +1,7 @@
 # Gmail Filter Bot - Private Data
 # Add your filter entries to this file
 filters.yaml
-filters.yml
+filters*.yaml.bak
 
 # Credentials and config
 .env

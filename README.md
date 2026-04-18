@@ -54,9 +54,29 @@ Or use a credentials file:
 cp client_credentials.json credentials.json
 ```
 
-### 2. Create filter configuration
+### 2. Create your filter configuration
 
-Create `filters.yaml` (this file is gitignored and contains your private filter data):
+**Option A: Import from Gmail (Recommended)**
+
+If you already have filters in Gmail, run `init` to automatically create `filters.yaml` from your existing filters:
+
+```bash
+gmail-filter-bot init
+```
+
+This will:
+- Fetch all your existing Gmail filters
+- Group them by action and label
+- Create `filters.yaml` with everything already configured
+
+Preview first with `--dry-run`:
+```bash
+gmail-filter-bot init --dry-run
+```
+
+**Option B: Create manually**
+
+Create `filters.yaml` yourself (this file is gitignored and contains your private filter data):
 
 ```yaml
 # Maximum entries per filter (Gmail default is ~50)
@@ -71,14 +91,14 @@ filters:
       - newsletter1@example.com
       - newsletter2@example.com
       - updates@company.com
-  
+
   shopping:
     action: label_only
     label: Shopping
     entries:
       - orders@amazon.com
       - receipts@target.com
-  
+
   social:
     action: archive
     entries:
@@ -103,21 +123,23 @@ Available actions:
 
 | Command | Description | Common Flags |
 |---------|-------------|--------------|
-| `init` | Import existing Gmail filters from your account into `filters.yaml`. Run this first if you already have filters in Gmail. | `--dry-run`: Preview what would be imported |
-| `apply` | **Main command** - syncs changes between local config and Gmail. Auto-detects direction (pull from Gmail, push to Gmail, or both). | `--dry-run`: Preview changes<br>`--push`: Force push local → Gmail only<br>`--sync`: Force sync Gmail → local only<br>`--no-apply-existing`: Skip labeling existing conversations |
+| `init` | Import existing Gmail filters from your account into `filters.yaml`. **Run this first** to automatically create your config from Gmail. | `--dry-run`: Preview what would be imported |
+| `plan` | Preview what changes would be applied. Shows exactly what would happen during apply without making any changes. | `--push`: Show push plan only<br>`--sync`: Show sync plan only |
+| `apply` | **Main command** - syncs changes between local config and Gmail. Auto-detects direction and applies changes immediately. | `--push`: Force push local → Gmail only<br>`--sync`: Force sync Gmail → local only<br>`--no-apply-existing`: Skip labeling existing conversations |
 | `clean` | Optimize your configuration by removing duplicates and consolidating similar filters. | `--dry-run`: Preview changes |
 
 ### Quick Start
 
 ```bash
 # 1. Import existing Gmail filters (one-time setup)
+# This automatically creates filters.yaml from your Gmail filters
 gmail-filter-bot init
 
-# 2. Apply changes (use this daily)
-gmail-filter-bot apply
+# 2. Preview what would change
+gmail-filter-bot plan
 
-# 3. Preview before applying
-gmail-filter-bot apply --dry-run
+# 3. Apply changes (use this daily)
+gmail-filter-bot apply
 
 # 4. Optimize configuration (remove duplicates, consolidate)
 gmail-filter-bot clean
@@ -134,19 +156,26 @@ gmail-filter-bot init
 gmail-filter-bot init --dry-run
 ```
 
+**Plan changes (preview):**
+```bash
+# Preview what would happen without making changes
+gmail-filter-bot plan
+
+# Preview specific direction
+gmail-filter-bot plan --push   # Show what would be pushed
+gmail-filter-bot plan --sync   # Show what would be synced
+```
+
 **Apply changes:**
 ```bash
-# Auto-detect direction and sync
+# Auto-detect direction and sync (applies immediately)
 gmail-filter-bot apply
-
-# Preview what would happen
-gmail-filter-bot apply --dry-run
 
 # Force specific direction
 gmail-filter-bot apply --push   # Only push local changes
 gmail-filter-bot apply --sync   # Only pull Gmail changes
 
-# Skip expensive "apply to existing" step
+# Skip "apply to existing" step (don't label existing conversations)
 gmail-filter-bot apply --no-apply-existing
 ```
 

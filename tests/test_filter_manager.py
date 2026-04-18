@@ -907,7 +907,7 @@ class TestPush:
     def test_push_entry_change_triggers_apply_existing(
         self, filter_manager, mock_gmail_client, mock_config
     ):
-        """Test that entry changes trigger apply to existing."""
+        """Test that entry changes trigger apply to existing for only new entries."""
         mock_gmail_client.list_filters.return_value = [
             {
                 "id": "filter1",
@@ -935,6 +935,11 @@ class TestPush:
 
         # Should call apply_label_to_existing since entries changed
         mock_gmail_client.apply_label_to_existing.assert_called_once()
+
+        # Should only apply label to NEW entries (local_only), not all entries
+        call_args = mock_gmail_client.apply_label_to_existing.call_args
+        applied_entries = call_args[0][0]  # First positional argument
+        assert applied_entries == ["c@example.com"]  # Only the new entry, not a@ or b@
 
 
 class TestPushSplitFilters:

@@ -17,8 +17,8 @@ def main():
         epilog="""
 Examples:
   gmail-filter-bot init              # Import existing Gmail filters
+  gmail-filter-bot plan              # Preview what would change
   gmail-filter-bot apply             # Sync changes (auto-detects direction)
-  gmail-filter-bot apply --dry-run   # Preview what would change
   gmail-filter-bot clean             # Remove duplicates and optimize config
         """,
     )
@@ -49,6 +49,26 @@ Examples:
         help="Preview what would be imported",
     )
 
+    # plan command - preview changes without applying
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Preview what changes would be applied",
+        description="""Preview what changes would be applied without making any changes.
+
+Shows a detailed plan of what would happen during an apply operation,
+including which filters would be created, updated, or skipped.""",
+    )
+    plan_parser.add_argument(
+        "--push",
+        action="store_true",
+        help="Show plan for push local → Gmail only",
+    )
+    plan_parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Show plan for sync Gmail → local only",
+    )
+
     # apply command - the main workflow
     apply_parser = subparsers.add_parser(
         "apply",
@@ -59,12 +79,10 @@ By default, this performs a two-way sync:
   - Pulls new/deleted entries from Gmail
   - Pushes local changes to Gmail
 
-Use --push or --sync to force a specific direction.""",
-    )
-    apply_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would change without applying",
+Use --push or --sync to force a specific direction.
+
+WARNING: This command applies changes immediately without confirmation.
+Use 'plan' first to preview what would change.""",
     )
     apply_parser.add_argument(
         "--push",
@@ -94,6 +112,19 @@ Use --push or --sync to force a specific direction.""",
         help="Show what would change without modifying filters.yaml",
     )
 
+    # help command
+    help_parser = subparsers.add_parser(
+        "help",
+        help="Show detailed help information",
+        description="Show detailed help and troubleshooting information.",
+    )
+    help_parser.add_argument(
+        "topic",
+        nargs="?",
+        default=None,
+        help="Topic to get help on (commands, auth, config, troubleshooting)",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -116,10 +147,14 @@ Use --push or --sync to force a specific direction.""",
         # Initialize filter manager
         manager = FilterManager(config, client, args.config)
 
-        if args.command == "apply":
+        if args.command == "plan":
+            return cmd_plan(manager, args)
+        elif args.command == "apply":
             return cmd_apply(manager, args)
         elif args.command == "clean":
             return cmd_clean(manager, args)
+        elif args.command == "help":
+            return cmd_help(args)
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -294,9 +329,101 @@ def _classify_action(add_labels, remove_labels, client=None):
     return action, label
 
 
+def cmd_plan(manager: FilterManager, args):
+    """Handle plan command - preview changes without applying."""
+    force_push = args.push
+    force_sync = args.sync
+
+    # Validate first
+    print("Validating configuration...")
+    validation = manager.validate()
+    if not validation["valid"]:
+        print("\nValidation errors:")
+        for error in validation["errors"]:
+            print(f"  - {error}")
+        return 1
+
+    print(f"  ✓ {validation['total_filters']} filter(s), {validation['total_entries']} entries")
+
+    if validation.get("splits"):
+        print("\nFilters requiring auto-split:")
+        for split in validation["splits"]:
+            print(f"  - {split['name']}: {split['entries']} entries → {split['parts']} parts")
+
+    # Detect changes
+    print("\nAnalyzing changes...")
+    changes = manager.detect_changes()
+
+    # Classify changes
+    push_changes = [
+        c for c in changes if c.has_entry_changes or c.action_changed or c.label_changed
+    ]
+    sync_changes = [c for c in changes if c.has_entry_changes]
+
+    # Determine operation mode
+    if force_push and force_sync:
+        print("Error: Cannot use both --push and --sync")
+        return 1
+
+    if force_push:
+        mode = "push"
+    elif force_sync:
+        mode = "sync"
+    else:
+        # Auto-detect: if there are remote-only changes, suggest sync
+        has_remote_changes = any(c.remote_only for c in changes)
+        has_local_changes = any(
+            c.local_only or c.action_changed or c.label_changed for c in changes
+        )
+
+        if has_remote_changes and has_local_changes:
+            mode = "both"
+        elif has_remote_changes:
+            mode = "sync"
+        else:
+            mode = "push"
+
+    print(f"\nMode: {mode}")
+
+    # Show changes
+    if not changes:
+        print("\nNo changes detected. Everything is in sync!")
+        return 0
+
+    print(f"\nDetected {len(changes)} filter(s) with changes:")
+    for change in changes:
+        print(f"\n  {change.name}:")
+        if change.local_only:
+            print(f"    + {len(change.local_only)} entries (local only - would be pushed)")
+            for entry in sorted(change.local_only)[:5]:
+                print(f"        {entry}")
+            if len(change.local_only) > 5:
+                print(f"        ... and {len(change.local_only) - 5} more")
+        if change.remote_only:
+            print(f"    - {len(change.remote_only)} entries (remote only - would be pulled)")
+            for entry in sorted(change.remote_only)[:5]:
+                print(f"        {entry}")
+            if len(change.remote_only) > 5:
+                print(f"        ... and {len(change.remote_only) - 5} more")
+        if change.action_changed:
+            print(f"    ~ action changed")
+        if change.label_changed:
+            print(f"    ~ label changed")
+
+    # Show push preview for detailed output
+    if push_changes:
+        print("\n" + "-" * 50)
+        print("Push preview (local → Gmail):")
+        manager.push(apply_to_existing=False, verbose=False, dry_run=True)
+
+    print("\n" + "=" * 50)
+    print("Run 'gmail-filter-bot apply' to apply these changes.")
+
+    return 0
+
+
 def cmd_apply(manager: FilterManager, args):
     """Handle apply command - smart two-way sync."""
-    dry_run = args.dry_run
     force_push = args.push
     force_sync = args.sync
     no_apply_existing = args.no_apply_existing
@@ -350,17 +477,16 @@ def cmd_apply(manager: FilterManager, args):
         else:
             mode = "push"
 
-    if dry_run:
-        print(f"\n[DRY RUN] Mode: {mode}")
+    print(f"\nMode: {mode}")
 
     # Show changes
     if not changes:
         print("\nNo changes detected. Everything is in sync!")
         return 0
 
-    print(f"\nDetected {len(changes)} filter(s) with changes:")
+    print(f"\nApplying {len(changes)} filter(s) with changes...")
     for change in changes:
-        print(f"\n  {change.name}:")
+        print(f"  {change.name}:")
         if change.local_only:
             print(f"    + {len(change.local_only)} entries (local only)")
         if change.remote_only:
@@ -369,21 +495,6 @@ def cmd_apply(manager: FilterManager, args):
             print(f"    ~ action changed")
         if change.label_changed:
             print(f"    ~ label changed")
-
-    if dry_run:
-        print("\n[DRY RUN] No changes made.")
-        return 0
-
-    # Confirm before applying
-    if mode == "both":
-        print("\nWarning: Changes detected in both directions!")
-        print("  - Some entries exist only in Gmail (will be pulled)")
-        print("  - Some entries exist only locally (will be pushed)")
-
-    response = input(f"\nApply {mode} changes? [y/N]: ")
-    if response.lower() != "y":
-        print("Aborted.")
-        return 0
 
     # Execute operations
     results = {"synced": 0, "pushed": 0, "skipped": 0}
@@ -460,5 +571,174 @@ def cmd_clean(manager: FilterManager, args):
         print("\n[DRY RUN] No changes saved.")
     else:
         print(f"\nConfiguration saved to {manager.config_path}")
+
+    return 0
+
+
+def cmd_help(args):
+    """Handle help command - show detailed help information."""
+    topic = args.topic
+
+    if topic is None or topic == "commands":
+        print("""
+Gmail Filter Bot - Command Reference
+====================================
+
+Available Commands:
+
+  init              Import existing Gmail filters into local config
+                    Usage: gmail-filter-bot init [--dry-run]
+
+  plan              Preview what changes would be applied
+                    Usage: gmail-filter-bot plan [--push] [--sync]
+
+  apply             Sync changes between local config and Gmail
+                    Usage: gmail-filter-bot apply [--push] [--sync]
+
+  clean             Remove duplicates and optimize filter configuration
+                    Usage: gmail-filter-bot clean [--dry-run]
+
+  help              Show this help message
+                    Usage: gmail-filter-bot help [topic]
+
+Global Options:
+
+  --config PATH     Path to filters.yaml (default: filters.yaml)
+  --credentials PATH  Path to .env file with credentials (default: .env)
+
+Run 'gmail-filter-bot help <topic>' for more details on:
+  - commands       This help message
+  - auth           Authentication and credentials setup
+  - config         Configuration file format
+  - troubleshooting Common issues and solutions
+""")
+
+    elif topic == "auth":
+        print("""
+Authentication Setup
+====================
+
+Gmail Filter Bot uses OAuth2 to access your Gmail account. You need to:
+
+1. Create a Google Cloud Project:
+   - Go to https://console.cloud.google.com/
+   - Create a new project
+
+2. Enable the Gmail API:
+   - Navigate to "APIs & Services" > "Library"
+   - Search for "Gmail API" and enable it
+
+3. Create OAuth Credentials:
+   - Go to "APIs & Services" > "Credentials"
+   - Click "Create Credentials" > "OAuth client ID"
+   - Choose "Desktop app" as application type
+   - Download the client credentials
+
+4. Create a .env file with your credentials:
+
+   GMAIL_CLIENT_ID=your-client-id.apps.googleusercontent.com
+   GMAIL_CLIENT_SECRET=your-client-secret
+   GMAIL_REDIRECT_URI=http://localhost:8080
+
+5. Run the init command:
+   gmail-filter-bot init
+
+   This will open a browser for you to authorize the app.
+   The token will be saved to token.json for future use.
+
+Token Expiration:
+-----------------
+If you see "Token has been expired or revoked", the app will
+automatically re-authenticate you. Just run the command again.
+
+To force re-authentication, delete token.json:
+  rm token.json
+""")
+
+    elif topic == "config":
+        print("""
+Configuration File Format
+=========================
+
+The filters.yaml file defines your Gmail filters:
+
+  max_entries_per_filter: 50  # Gmail limit per filter
+
+  filters:
+    newsletters:               # Filter name
+      action: label_and_archive
+      label: Newsletters
+      entries:
+        - newsletter@example.com
+        - updates@company.com
+
+    spam:                      # Filter name
+      action: delete
+      entries:
+        - spam@bad-actor.com
+
+Available Actions:
+
+  label_only          - Apply label, keep in inbox
+  label_and_archive   - Apply label and archive (remove from inbox)
+  archive             - Archive only (no label)
+  delete              - Send to trash
+  star                - Star the message
+  mark_important      - Mark as important
+  mark_not_important  - Mark as not important
+
+Entry Formats:
+
+  - Simple email: user@example.com
+  - Domain wildcard: *@example.com
+  - Multiple domains: {@domain1.com, @domain2.com}
+
+The app automatically splits filters that exceed the entry limit.
+""")
+
+    elif topic == "troubleshooting":
+        print("""
+Troubleshooting
+===============
+
+Error: "Token has been expired or revoked"
+-------------------------------------------
+Solution: The app will automatically re-authenticate you.
+Just run the command again. If it persists, delete token.json:
+  rm token.json
+
+Error: "FileNotFoundError: filters.yaml"
+---------------------------------------
+Solution: Run init first to create the config file:
+  gmail-filter-bot init
+
+Error: "invalid_client" or authentication fails
+----------------------------------------------
+Solution: Check your .env file has correct credentials:
+  - GMAIL_CLIENT_ID should end with .apps.googleusercontent.com
+  - GMAIL_CLIENT_SECRET should be complete (not truncated)
+  - Make sure the Gmail API is enabled in Google Cloud Console
+
+Filter not working as expected
+------------------------------
+- Check the action type matches what you want
+- Verify email addresses are correct
+- Use --dry-run to preview changes before applying
+- Check Gmail web interface to see current filters
+
+Too many entries for one filter
+-------------------------------
+The app automatically splits filters exceeding max_entries_per_filter.
+You can adjust this in filters.yaml, but Gmail has hard limits.
+
+Still having issues?
+--------------------
+Check the GitHub repository or run with --help for more options.
+""")
+
+    else:
+        print(f"Unknown topic: {topic}")
+        print("Run 'gmail-filter-bot help' for available topics.")
+        return 1
 
     return 0

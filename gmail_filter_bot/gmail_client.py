@@ -1,8 +1,10 @@
 """Gmail API client for filter operations."""
 
+import sys
 from pathlib import Path
 from typing import Any
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials as GoogleCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -40,8 +42,14 @@ class GmailClient:
         # If no valid credentials, get them
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except RefreshError:
+                    # Token expired or revoked, need to re-authenticate
+                    print("Token expired or revoked. Re-authenticating...", file=sys.stderr)
+                    creds = None
+
+            if not creds:
                 # Create flow from client credentials
                 client_config = {
                     "installed": {
@@ -79,9 +87,16 @@ class GmailClient:
         label: str | None = None,
     ) -> dict[str, Any]:
         """Create a new filter."""
+        # Filter out None values and ensure all entries are strings
+        valid_addresses = [
+            str(addr).strip() for addr in from_addresses if addr is not None and str(addr).strip()
+        ]
+        if not valid_addresses:
+            raise ValueError("No valid from addresses provided")
+
         # Build criteria
         criteria = {
-            "from": " OR ".join(from_addresses),
+            "from": " OR ".join(valid_addresses),
         }
 
         # Build action
@@ -228,8 +243,13 @@ class GmailClient:
 
         total_modified = 0
 
+        # Filter out None/empty addresses
+        valid_addresses = [
+            str(addr).strip() for addr in from_addresses if addr is not None and str(addr).strip()
+        ]
+
         # Search for messages matching each from address
-        for from_addr in from_addresses:
+        for from_addr in valid_addresses:
             query = f"from:{from_addr}"
 
             try:

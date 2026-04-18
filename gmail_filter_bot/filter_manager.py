@@ -490,9 +490,12 @@ class FilterManager:
                         )
 
                 if name in entry_changes_names and apply_to_existing and filter_config.label:
-                    print(
-                        f"    [DRY RUN] Would apply label '{filter_config.label}' to existing conversations"
-                    )
+                    # Only apply label to NEW entries (local_only), not all entries
+                    new_entries = list(change.local_only)
+                    if new_entries:
+                        print(
+                            f"    [DRY RUN] Would apply label '{filter_config.label}' to {len(new_entries)} new conversation(s)"
+                        )
 
             for name in unchanged_names:
                 entry_count = len(self.config.filters[name].entries)
@@ -580,18 +583,23 @@ class FilterManager:
 
                 results["split_filters"].append(name)
 
-            # Apply labels to existing conversations ONLY if entries changed
+            # Apply labels to existing conversations ONLY for NEW entries (local_only)
             # (Action/label changes don't affect existing messages)
             if apply_to_existing and name in entry_changes_names and filter_config.label:
-                print(f"  → Applying label '{filter_config.label}' to existing conversations...")
-                label_id = self.client._get_or_create_label(filter_config.label)
-                archive = filter_config.action in ["label_and_archive", "archive"]
-                modified_count = self.client.apply_label_to_existing(
-                    entries, label_id, archive=archive
-                )
-                results["applied_to_existing"] += modified_count
-                if modified_count > 0:
-                    print(f"    ✓ Applied to {modified_count} conversation(s)")
+                # Only apply label to the NEW entries being added, not all entries
+                new_entries = list(change.local_only)
+                if new_entries:
+                    print(
+                        f"  → Applying label '{filter_config.label}' to {len(new_entries)} new conversation(s)..."
+                    )
+                    label_id = self.client._get_or_create_label(filter_config.label)
+                    archive = filter_config.action in ["label_and_archive", "archive"]
+                    modified_count = self.client.apply_label_to_existing(
+                        new_entries, label_id, archive=archive
+                    )
+                    results["applied_to_existing"] += modified_count
+                    if modified_count > 0:
+                        print(f"    ✓ Applied to {modified_count} conversation(s)")
 
         # Report unchanged filters
         for name in unchanged_names:

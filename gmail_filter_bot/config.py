@@ -18,6 +18,13 @@ class FilterConfig:
     def __post_init__(self):
         if self.entries is None:
             self.entries = []
+        else:
+            # Filter out None/empty entries
+            self.entries = [
+                str(entry).strip()
+                for entry in self.entries
+                if entry is not None and str(entry).strip()
+            ]
 
 
 @dataclass
