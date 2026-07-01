@@ -88,6 +88,17 @@ class Config:
     max_entries_per_filter: int
     filters: dict[str, FilterConfig]
     credentials: Credentials
+    allowed: list[str] = None
+
+    def __post_init__(self):
+        if self.allowed is None:
+            self.allowed = []
+        else:
+            self.allowed = [
+                str(entry).strip()
+                for entry in self.allowed
+                if entry is not None and str(entry).strip()
+            ]
 
     @classmethod
     def load(cls, config_path: Path, credentials_path: Path) -> "Config":
@@ -119,18 +130,26 @@ class Config:
                 entries=filter_data.get("entries", []),
             )
 
+        # Parse allowed list
+        allowed = data.get("allowed", [])
+
         return cls(
             max_entries_per_filter=data.get("max_entries_per_filter", 50),
             filters=filters,
             credentials=credentials,
+            allowed=allowed,
         )
 
     def save(self, path: Path):
         """Save configuration to file."""
-        data = {
+        data: dict = {
             "max_entries_per_filter": self.max_entries_per_filter,
-            "filters": {},
         }
+
+        if self.allowed:
+            data["allowed"] = self.allowed
+
+        data["filters"] = {}
 
         for name, filter_config in self.filters.items():
             filter_data = {

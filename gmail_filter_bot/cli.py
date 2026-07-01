@@ -19,6 +19,8 @@ Examples:
   gmail-filter-bot init              # Import existing Gmail filters
   gmail-filter-bot plan              # Preview what would change
   gmail-filter-bot apply             # Sync changes (auto-detects direction)
+  gmail-filter-bot label             # Interactively triage Inbox senders
+  gmail-filter-bot label newsletters # Triage senders in the newsletters label
   gmail-filter-bot clean             # Remove duplicates and optimize config
         """,
     )
@@ -125,6 +127,33 @@ Use 'plan' first to preview what would change.""",
         help="Topic to get help on (commands, auth, config, troubleshooting)",
     )
 
+    # label command - interactive sender triage
+    label_parser = subparsers.add_parser(
+        "label",
+        help="Interactively triage and label email senders",
+        description="""Fetch unique senders from a Gmail folder and interactively
+assign them to filters. Present each sender one by one:
+  (f)ilter - assign to a filter (with autocomplete)
+  (a)llow  - skip this sender
+  (s)pam   - add to spam (delete) filter
+  (q)uit   - exit and proceed to summary
+
+After the session, changes are saved to filters.yaml and you'll be
+prompted to apply them to Gmail.""",
+    )
+    label_parser.add_argument(
+        "folder",
+        nargs="?",
+        default="Inbox",
+        help="Gmail folder/label to look for messages (default: Inbox)",
+    )
+    label_parser.add_argument(
+        "--max-messages",
+        type=int,
+        default=200,
+        help="Maximum number of recent messages to scan (default: 200)",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -153,6 +182,8 @@ Use 'plan' first to preview what would change.""",
             return cmd_apply(manager, args)
         elif args.command == "clean":
             return cmd_clean(manager, args)
+        elif args.command == "label":
+            return cmd_label(manager, args)
         elif args.command == "help":
             return cmd_help(args)
 
@@ -575,6 +606,302 @@ def cmd_clean(manager: FilterManager, args):
     return 0
 
 
+def cmd_label(manager: FilterManager, args):
+    """Handle label command - interactively triage and label email senders."""
+    import questionary
+
+    folder = args.folder
+    max_messages = args.max_messages
+
+    print(f"Fetching unique senders from '{folder}' (up to {max_messages} messages)...")
+
+    label_id = manager.client._resolve_label_id(folder)
+    if label_id is None:
+        print(f"Error: Label '{folder}' not found in Gmail.", file=sys.stderr)
+        available = list(manager.client.list_labels().keys())
+        if available:
+            print(f"\nAvailable labels: {', '.join(sorted(available))}", file=sys.stderr)
+        return 1
+
+    senders = manager.client.list_senders(label_id, max_results=max_messages)
+
+    if not senders:
+        print("No senders found.")
+        return 0
+
+    print(f"Found {len(senders)} unique sender(s).")
+
+    # Filter out senders already covered by existing filter entries
+    new_senders = [s for s in senders if not _is_sender_filtered(s[1], manager.config)]
+    skipped = len(senders) - len(new_senders)
+    if skipped:
+        print(f"Skipping {skipped} sender(s) already covered by existing filters.")
+
+    if not new_senders:
+        print("All senders are already categorized. Nothing to do.")
+        return 0
+
+    print(f"\n{len(new_senders)} sender(s) to triage.")
+    print("Commands: (f)ilter, (a)llow, (s)pam, (q)uit\n")
+
+    # Track changes
+    changes: dict[str, list[str]] = {}  # filter_name -> list of added emails
+    allowed_count = 0
+    spammed_count = 0
+    filtered_count = 0
+    should_quit = False
+
+    for i, (display_name, email) in enumerate(new_senders, 1):
+        prompt_text = f"[{i}/{len(new_senders)}] {display_name} <{email}>\n  [f]ilter / [a]llow / [s]pam / [q]uit: "
+
+        while True:
+            try:
+                choice = input(prompt_text).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nExiting triage early.")
+                should_quit = True
+                break
+
+            if choice in ("f", "filter"):
+                filter_name = _prompt_filter_selection(manager.config, questionary)
+                if filter_name is None:
+                    print("  Cancelled. Try again.")
+                    continue
+                if filter_name not in manager.config.filters:
+                    from .config import FilterConfig
+
+                    manager.config.filters[filter_name] = FilterConfig(
+                        name=filter_name,
+                        action="label_and_archive",
+                        label=filter_name,
+                        entries=[],
+                    )
+                if email not in manager.config.filters[filter_name].entries:
+                    manager.config.filters[filter_name].entries.append(email)
+                    changes.setdefault(filter_name, []).append(email)
+                filtered_count += 1
+                print(f"  -> Added to '{filter_name}'")
+                break
+
+            elif choice in ("a", "allow"):
+                if not hasattr(manager.config, "allowed") or manager.config.allowed is None:
+                    manager.config.allowed = []
+                if email not in manager.config.allowed:
+                    manager.config.allowed.append(email)
+                allowed_count += 1
+                print("  -> Allowed (skipped)")
+                break
+
+            elif choice in ("s", "spam"):
+                _add_to_spam(manager.config, email)
+                changes.setdefault("spam", []).append(email)
+                spammed_count += 1
+                print("  -> Marked as spam (delete)")
+                print("  Reporting existing messages as spam...", end=" ", flush=True)
+                try:
+                    reported = manager.client.report_spam([email])
+                    if reported:
+                        print(f"reported {reported} message(s).")
+                    else:
+                        print("no existing messages found.")
+                except Exception as e:
+                    print(f"error: {e}")
+                break
+
+            elif choice in ("q", "quit"):
+                print("\nExiting triage early.")
+                should_quit = True
+                break
+
+            else:
+                print("  Invalid choice. Use f, a, s, or q.")
+
+        if should_quit:
+            break
+
+    # Summary
+    print(f"\n{'=' * 50}")
+    print("Triage Summary:")
+    print(f"  Filtered: {filtered_count} sender(s)")
+    print(f"  Allowed:  {allowed_count} sender(s)")
+    print(f"  Spammed:  {spammed_count} sender(s)")
+
+    if not changes and allowed_count == 0:
+        print("\nNo changes made.")
+        return 0
+
+    if changes:
+        print("\nFilters updated:")
+        for filter_name, emails in sorted(changes.items()):
+            print(f"  {filter_name}: +{len(emails)} sender(s)")
+            for email in emails:
+                print(f"    - {email}")
+
+    # Save updated config (includes allowed list + any filter changes)
+    manager.config.save(manager.config_path)
+    print(f"\nSaved to {manager.config_path}")
+
+    # Plan preview
+    print("\n" + "-" * 50)
+    print("Plan: changes that would be pushed to Gmail:")
+    try:
+        validation = manager.validate()
+        if not validation["valid"]:
+            print("\nValidation errors:")
+            for error in validation["errors"]:
+                print(f"  - {error}")
+            print("\nFix the errors in filters.yaml before applying.")
+            return 1
+        push_changes = manager.detect_changes()
+        if push_changes:
+            for change in push_changes:
+                print(f"  {change.name}:")
+                if change.local_only:
+                    print(f"    + {len(change.local_only)} new sender(s)")
+        else:
+            print("  No changes detected (all entries already in Gmail).")
+    except Exception as e:
+        print(f"  Could not detect changes: {e}")
+
+    # Apply prompt
+    response = input("\nApply changes to Gmail? [y/N] ").strip().lower()
+    if response not in ("y", "yes"):
+        print("Not applying. You can run 'gfb apply' later.")
+        return 0
+
+    print("\nApplying to Gmail...")
+    try:
+        push_results = manager.push(apply_to_existing=True, verbose=False, dry_run=False)
+        print(f"\nPushed {push_results['created']} filter(s) to Gmail.")
+        if push_results.get("skipped"):
+            print(f"Skipped {push_results['skipped']} filter(s) (no changes).")
+        if push_results.get("applied_to_existing"):
+            print(
+                f"Applied labels to {push_results['applied_to_existing']} existing conversation(s)."
+            )
+    except Exception as e:
+        print(f"Error applying: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+def _is_sender_filtered(email: str, config) -> bool:
+    """Check if a sender email is already covered by an existing filter entry or allowed list.
+
+    Matches against:
+      - Exact email address
+      - *@domain.com wildcards
+      - *domain.com bare domain wildcards
+      - The config's allowed list (emails previously marked as "allow")
+    """
+    email_lower = email.lower()
+
+    # Check allowed list
+    if hasattr(config, "allowed") and config.allowed:
+        for allowed_email in config.allowed:
+            if allowed_email.lower() == email_lower:
+                return True
+
+    domain = email_lower.rsplit("@", 1)[-1] if "@" in email_lower else ""
+
+    for filter_config in config.filters.values():
+        for entry in filter_config.entries:
+            entry = entry.strip()
+            if not entry:
+                continue
+            entry_lower = entry.lower()
+
+            if entry_lower == email_lower:
+                return True
+
+            if entry_lower.startswith("*@"):
+                pattern_domain = entry_lower[2:]
+                if domain == pattern_domain:
+                    return True
+
+            if entry_lower.startswith("*") and not entry_lower.startswith("*@"):
+                pattern_domain = entry_lower[1:]
+                if domain == pattern_domain or domain.endswith("." + pattern_domain):
+                    return True
+
+    return False
+
+
+def _add_to_spam(config, email: str):
+    """Add an email to the spam filter, creating it if necessary."""
+    from .config import FilterConfig
+
+    if "spam" not in config.filters:
+        config.filters["spam"] = FilterConfig(
+            name="spam",
+            action="delete",
+            entries=[],
+        )
+
+    if email not in config.filters["spam"].entries:
+        config.filters["spam"].entries.append(email)
+
+
+def _prompt_filter_selection(config, questionary_module):
+    """Prompt user to select a filter.
+
+    Shows top 5 most popular filters (by entry count) as a selectable list,
+    plus an "Other (type name)" option. If "Other" is chosen, falls back to
+    autocomplete from all existing filter names.
+    """
+    filter_names = list(config.filters.keys())
+
+    if not filter_names:
+        return None
+
+    # Top 5 most popular by entry count
+    by_count = sorted(
+        filter_names,
+        key=lambda n: len(config.filters[n].entries),
+        reverse=True,
+    )
+    top_5 = by_count[:5]
+
+    # Build selectable choices with entry counts
+    choices = []
+    for name in top_5:
+        choices.append(
+            questionary_module.Choice(
+                title=f"{name} ({len(config.filters[name].entries)} entries)",
+                value=name,
+            )
+        )
+
+    if len(filter_names) > 5:
+        choices.append(
+            questionary_module.Choice(
+                title="Other (type name)",
+                value="__other__",
+            )
+        )
+
+    try:
+        choice = questionary_module.select(
+            "  Select filter:",
+            choices=choices,
+        ).ask()
+
+        if choice is None:
+            return None
+
+        if choice == "__other__":
+            # Fall back to autocomplete for custom selection
+            choice = questionary_module.autocomplete(
+                "  Type filter name:",
+                choices=filter_names,
+            ).ask()
+
+        return choice
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+
 def cmd_help(args):
     """Handle help command - show detailed help information."""
     topic = args.topic
@@ -594,6 +921,9 @@ Available Commands:
 
   apply             Sync changes between local config and Gmail
                     Usage: gmail-filter-bot apply [--push] [--sync]
+
+  label             Interactively triage and label email senders
+                    Usage: gmail-filter-bot label [folder] [--max-messages N]
 
   clean             Remove duplicates and optimize filter configuration
                     Usage: gmail-filter-bot clean [--dry-run]

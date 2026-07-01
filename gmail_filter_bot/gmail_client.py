@@ -1,5 +1,6 @@
 """Gmail API client for filter operations."""
 
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -147,14 +148,22 @@ class GmailClient:
         ).execute()
 
     def _get_or_create_label(self, label_name: str) -> str:
-        """Get label ID by name, creating if necessary."""
+        """Get label ID by name, creating if necessary.
+
+        Handles case-insensitive label name matching (Gmail labels are
+        case-insensitive for creation but the list API preserves case).
+        Falls back to re-fetching if a 409 conflict occurs (e.g. label
+        was created by a concurrent call or existed with different casing).
+        """
+        label_name_lower = label_name.lower()
+
         # List existing labels
         results = self.service.users().labels().list(userId="me").execute()
         labels = results.get("labels", [])
 
-        # Check if label exists
+        # Check if label exists (case-insensitive)
         for label in labels:
-            if label["name"] == label_name:
+            if label["name"].lower() == label_name_lower:
                 return label["id"]
 
         # Create new label
@@ -164,17 +173,26 @@ class GmailClient:
             "messageListVisibility": "show",
         }
 
-        result = (
-            self.service.users()
-            .labels()
-            .create(
-                userId="me",
-                body=label_body,
+        try:
+            result = (
+                self.service.users()
+                .labels()
+                .create(
+                    userId="me",
+                    body=label_body,
+                )
+                .execute()
             )
-            .execute()
-        )
-
-        return result["id"]
+            return result["id"]
+        except HttpError as e:
+            if e.resp.status == 409:
+                # Label already exists (possibly different casing) — re-fetch
+                results = self.service.users().labels().list(userId="me").execute()
+                labels = results.get("labels", [])
+                for label in labels:
+                    if label["name"].lower() == label_name_lower:
+                        return label["id"]
+            raise
 
     def parse_filter_entries(self, filter_obj: dict[str, Any]) -> list[str]:
         """Parse entries from a Gmail filter object."""
@@ -295,3 +313,187 @@ class GmailClient:
                 continue
 
         return total_modified
+
+    def report_spam(self, from_addresses: list[str]) -> int:
+        """Report existing messages from given addresses as spam.
+
+        Moves matching messages to the Spam folder by adding the SPAM
+        label and removing INBOX, which trains Gmail's spam filter.
+
+        Args:
+            from_addresses: List of email addresses to search for
+
+        Returns:
+            Number of messages reported as spam
+        """
+        total_reported = 0
+
+        valid_addresses = [
+            str(addr).strip() for addr in from_addresses if addr is not None and str(addr).strip()
+        ]
+
+        for from_addr in valid_addresses:
+            query = f"from:{from_addr}"
+
+            try:
+                results = self.service.users().messages().list(userId="me", q=query).execute()
+                messages = results.get("messages", [])
+
+                if not messages:
+                    continue
+
+                message_ids = [msg["id"] for msg in messages]
+
+                for i in range(0, len(message_ids), 1000):
+                    chunk = message_ids[i : i + 1000]
+
+                    body = {
+                        "ids": chunk,
+                        "addLabelIds": ["SPAM"],
+                        "removeLabelIds": ["INBOX"],
+                    }
+
+                    self.service.users().messages().batchModify(
+                        userId="me",
+                        body=body,
+                    ).execute()
+
+                    total_reported += len(chunk)
+
+            except HttpError as e:
+                print(f"Warning: Could not report spam for {from_addr}: {e}")
+                continue
+
+        return total_reported
+
+    def list_labels(self) -> dict[str, str]:
+        """List all labels in the Gmail account.
+
+        Returns:
+            Dict mapping label name → label ID for all labels
+            (system + custom).
+        """
+        results = self.service.users().labels().list(userId="me").execute()
+        labels = results.get("labels", [])
+        return {label["name"]: label["id"] for label in labels}
+
+    def _resolve_label_id(self, label_name: str) -> str | None:
+        """Resolve a label name to its ID.
+
+        Handles system labels (INBOX, SPAM, TRASH, etc.) directly,
+        and custom labels via the labels API.
+
+        Returns None if the label doesn't exist.
+        """
+        system_labels = {
+            "INBOX": "INBOX",
+            "SPAM": "SPAM",
+            "TRASH": "TRASH",
+            "UNREAD": "UNREAD",
+            "STARRED": "STARRED",
+            "IMPORTANT": "IMPORTANT",
+            "SENT": "SENT",
+            "DRAFT": "DRAFT",
+        }
+        upper = label_name.upper()
+        if upper in system_labels:
+            return system_labels[upper]
+
+        labels = self.list_labels()
+        # Case-insensitive lookup
+        for name, label_id in labels.items():
+            if name.lower() == label_name.lower():
+                return label_id
+        return None
+
+    @staticmethod
+    def _extract_email(from_header: str) -> str:
+        """Extract the bare email address from a From header.
+
+        Handles formats like:
+          "John Doe <john@example.com>"
+          "john@example.com"
+          "John Doe john@example.com (comment)"
+        """
+        match = re.search(r"<(.+?)>", from_header)
+        if match:
+            return match.group(1).strip()
+        # No angle brackets, try to find an email directly
+        match = re.search(r"[\w.+-]+@[\w.-]+\.\w+", from_header)
+        if match:
+            return match.group(0)
+        return from_header.strip()
+
+    def list_senders(self, label_id: str, max_results: int = 200) -> list[tuple[str, str]]:
+        """Fetch unique senders from messages with the given label.
+
+        Args:
+            label_id: Gmail label ID to search within
+            max_results: Maximum number of recent messages to fetch
+
+        Returns:
+            List of (display_name, email_address) tuples, deduplicated
+            by email address, preserving order of first appearance.
+        """
+        sender_map: dict[str, str] = {}
+        fetched = 0
+        page_token = None
+
+        while fetched < max_results:
+            remaining = max_results - fetched
+            list_params: dict[str, Any] = {
+                "userId": "me",
+                "maxResults": min(remaining, 500),
+            }
+            if label_id:
+                list_params["labelIds"] = [label_id]
+            if page_token:
+                list_params["pageToken"] = page_token
+
+            results = self.service.users().messages().list(**list_params).execute()
+            messages = results.get("messages", [])
+
+            if not messages:
+                break
+
+            # Batch-fetch metadata for these messages
+            for msg in messages:
+                if fetched >= max_results:
+                    break
+                try:
+                    msg_data = (
+                        self.service.users()
+                        .messages()
+                        .get(
+                            userId="me",
+                            id=msg["id"],
+                            format="metadata",
+                            metadataHeaders=["From"],
+                        )
+                        .execute()
+                    )
+                    headers = msg_data.get("payload", {}).get("headers", [])
+                    from_header = ""
+                    for h in headers:
+                        if h.get("name", "").lower() == "from":
+                            from_header = h.get("value", "")
+                            break
+
+                    if from_header:
+                        email_addr = self._extract_email(from_header)
+                        if email_addr and email_addr not in sender_map:
+                            display_name = from_header
+                            if f"<{email_addr}>" in from_header:
+                                display_name = from_header.split("<")[0].strip().strip('"')
+                            if not display_name:
+                                display_name = email_addr
+                            sender_map[email_addr] = display_name
+                except HttpError:
+                    continue
+                fetched += 1
+
+            page_token = results.get("nextPageToken")
+            if not page_token:
+                break
+
+        return [(name, email) for email, name in sender_map.items()]

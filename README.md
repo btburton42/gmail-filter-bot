@@ -12,9 +12,26 @@ A Python CLI tool to sync and manage Gmail filters from a local YAML configurati
 
 ## Installation
 
+### From PyPI (Recommended for Users)
+
+```bash
+pip install gmail-filter-bot
+```
+
+Then run:
+```bash
+gmail-filter-bot --help
+```
+
+### From Source (For Development)
+
 Using [uv](https://github.com/astral-sh/uv) (recommended):
 
 ```bash
+# Clone the repository
+git clone https://github.com/btburton42/gmail-filter-bot.git
+cd gmail-filter-bot
+
 # Install uv if you haven't already
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
