@@ -223,7 +223,7 @@ class TestDetectChanges:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
         changes = filter_manager.detect_changes()
 
@@ -371,7 +371,7 @@ class TestSync:
         )
         mock_config.save = Mock()
 
-        changes = filter_manager.sync(dry_run=False)
+        filter_manager.sync(dry_run=False)
 
         # Config should be updated with remote entries
         assert "new@example.com" in mock_config.filters["work"].entries
@@ -396,7 +396,7 @@ class TestSync:
         )
         mock_config.save = Mock()
 
-        changes = filter_manager.sync(dry_run=False)
+        filter_manager.sync(dry_run=False)
 
         # Config should be updated to match remote (without c@example.com)
         assert "c@example.com" not in mock_config.filters["work"].entries
@@ -802,7 +802,7 @@ class TestPush:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
         results = filter_manager.push()
 
@@ -834,7 +834,7 @@ class TestPush:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
         results = filter_manager.push()
 
@@ -865,7 +865,7 @@ class TestPush:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
         results = filter_manager.push(dry_run=True)
 
@@ -896,10 +896,10 @@ class TestPush:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
         mock_gmail_client.apply_label_to_existing.return_value = 0
 
-        results = filter_manager.push(apply_to_existing=True)
+        filter_manager.push(apply_to_existing=True)
 
         # Should NOT call apply_label_to_existing since only action changed
         mock_gmail_client.apply_label_to_existing.assert_not_called()
@@ -927,11 +927,11 @@ class TestPush:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
         mock_gmail_client._get_or_create_label.return_value = "Label_1"
         mock_gmail_client.apply_label_to_existing.return_value = 10
 
-        results = filter_manager.push(apply_to_existing=True)
+        filter_manager.push(apply_to_existing=True)
 
         # Should call apply_label_to_existing since entries changed
         mock_gmail_client.apply_label_to_existing.assert_called_once()
@@ -993,7 +993,7 @@ class TestPushSplitFilters:
             "Label_Work": "Work",
             "Label_News": "Newsletters",
             "Label_Big": "Big",
-        }.get(label_id, None)
+        }.get(label_id)
 
         results = filter_manager.push()
 
@@ -1050,7 +1050,7 @@ class TestPushSplitFilters:
             "Label_Work": "Work",
             "Label_News": "Newsletters",
             "Label_Big": "Big",
-        }.get(label_id, None)
+        }.get(label_id)
 
         results = filter_manager.push()
 
@@ -1111,9 +1111,9 @@ class TestPushEdgeCases:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Work",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
-        results = filter_manager.push(apply_to_existing=False)
+        filter_manager.push(apply_to_existing=False)
 
         mock_gmail_client.apply_label_to_existing.assert_not_called()
 
@@ -1138,7 +1138,7 @@ class TestPushEdgeCases:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "OldWorkName",  # Different from "Work"
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
         results = filter_manager.push()
 
@@ -1172,7 +1172,7 @@ class TestScrambledFilters:
         mock_gmail_client.get_label_name.side_effect = lambda label_id: {
             "Label_1": "Newsletters",
             "Label_2": "Newsletters",
-        }.get(label_id, None)
+        }.get(label_id)
 
         changes = filter_manager.detect_changes()
 

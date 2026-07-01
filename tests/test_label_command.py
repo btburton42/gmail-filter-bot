@@ -226,11 +226,28 @@ class TestListSenders:
             msg_id = kwargs.get("id")
             from_headers = {
                 "1": {
-                    "payload": {"headers": [{"name": "From", "value": "Alice <alice@example.com>"}]}
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Alice <alice@example.com>"},
+                            {"name": "Subject", "value": "Hello World"},
+                        ]
+                    }
                 },
-                "2": {"payload": {"headers": [{"name": "From", "value": "Bob <bob@example.com>"}]}},
+                "2": {
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Bob <bob@example.com>"},
+                            {"name": "Subject", "value": "Re: Project Update"},
+                        ]
+                    }
+                },
                 "3": {
-                    "payload": {"headers": [{"name": "From", "value": "Alice <alice@example.com>"}]}
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Alice <alice@example.com>"},
+                            {"name": "Subject", "value": "Another message"},
+                        ]
+                    }
                 },
             }
             result = MagicMock()
@@ -245,6 +262,10 @@ class TestListSenders:
         assert "alice@example.com" in emails
         assert "bob@example.com" in emails
         assert len(emails) == 2
+        # Subject from first occurrence is kept
+        subjects = {s[1]: s[2] for s in senders}
+        assert subjects["alice@example.com"] == "Hello World"
+        assert subjects["bob@example.com"] == "Re: Project Update"
 
     def test_list_senders_respects_max_results(self):
         client = _make_mock_client()

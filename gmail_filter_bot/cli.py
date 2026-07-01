@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .config import Config, Credentials
-from .filter_manager import FilterChange, FilterManager
+from .filter_manager import FilterManager
 from .gmail_client import GmailClient
 
 
@@ -134,8 +134,9 @@ Use 'plan' first to preview what would change.""",
         description="""Fetch unique senders from a Gmail folder and interactively
 assign them to filters. Present each sender one by one:
   (f)ilter - assign to a filter (with autocomplete)
-  (a)llow  - skip this sender
-  (s)pam   - add to spam (delete) filter
+  (a)llow  - skip this sender (remembered, won't appear again)
+  (s)pam   - add to spam (delete) filter and report as spam
+  (k)eep   - skip this sender for now (will appear again next time)
   (q)uit   - exit and proceed to summary
 
 After the session, changes are saved to filters.yaml and you'll be
@@ -191,7 +192,7 @@ prompted to apply them to Gmail.""",
         print(f"Error: {e}", file=sys.stderr)
         if args.command != "init":
             print(f"\nMake sure you've created the {args.config} file.", file=sys.stderr)
-            print(f"Run: gmail-filter-bot init", file=sys.stderr)
+            print("Run: gmail-filter-bot init", file=sys.stderr)
         return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -256,7 +257,7 @@ def cmd_init(credentials, client, args):
     filter_configs = {}
     name_counters = {}
 
-    for key, filter_data in imported_filters.items():
+    for _key, filter_data in imported_filters.items():
         # Generate a base name from label or action
         if filter_data["label"]:
             base_name = filter_data["label"].lower().replace(" ", "-").replace("_", "-")
@@ -309,7 +310,7 @@ def cmd_init(credentials, client, args):
     print(f"\nTotal entries imported: {sum(len(f.entries) for f in new_config.filters.values())}")
 
     print(f"\nEdit {config_path} to customize filter names and actions.")
-    print(f"Then run: gmail-filter-bot apply")
+    print("Then run: gmail-filter-bot apply")
 
     return 0
 
@@ -344,7 +345,7 @@ def _classify_action(add_labels, remove_labels, client=None):
 
     # Get custom label (not system labels)
     system_labels = {"INBOX", "STARRED", "IMPORTANT", "TRASH", "SPAM", "UNREAD"}
-    custom_labels = [l for l in add_labels if l not in system_labels]
+    custom_labels = [lbl for lbl in add_labels if lbl not in system_labels]
 
     if custom_labels:
         label_id = custom_labels[0]  # Take first custom label
@@ -389,7 +390,6 @@ def cmd_plan(manager: FilterManager, args):
     push_changes = [
         c for c in changes if c.has_entry_changes or c.action_changed or c.label_changed
     ]
-    sync_changes = [c for c in changes if c.has_entry_changes]
 
     # Determine operation mode
     if force_push and force_sync:
@@ -437,9 +437,9 @@ def cmd_plan(manager: FilterManager, args):
             if len(change.remote_only) > 5:
                 print(f"        ... and {len(change.remote_only) - 5} more")
         if change.action_changed:
-            print(f"    ~ action changed")
+            print("    ~ action changed")
         if change.label_changed:
-            print(f"    ~ label changed")
+            print("    ~ label changed")
 
     # Show push preview for detailed output
     if push_changes:
@@ -523,9 +523,9 @@ def cmd_apply(manager: FilterManager, args):
         if change.remote_only:
             print(f"    - {len(change.remote_only)} entries (remote only)")
         if change.action_changed:
-            print(f"    ~ action changed")
+            print("    ~ action changed")
         if change.label_changed:
-            print(f"    ~ label changed")
+            print("    ~ label changed")
 
     # Execute operations
     results = {"synced": 0, "pushed": 0, "skipped": 0}
@@ -631,28 +631,33 @@ def cmd_label(manager: FilterManager, args):
 
     print(f"Found {len(senders)} unique sender(s).")
 
-    # Filter out senders already covered by existing filter entries
+    # Filter out senders already covered by existing filter entries or allowed list
     new_senders = [s for s in senders if not _is_sender_filtered(s[1], manager.config)]
     skipped = len(senders) - len(new_senders)
     if skipped:
-        print(f"Skipping {skipped} sender(s) already covered by existing filters.")
+        print(f"Skipping {skipped} sender(s) already covered by existing filters or allowed list.")
 
     if not new_senders:
         print("All senders are already categorized. Nothing to do.")
         return 0
 
     print(f"\n{len(new_senders)} sender(s) to triage.")
-    print("Commands: (f)ilter, (a)llow, (s)pam, (q)uit\n")
+    print("Commands: (f)ilter, (a)llow, (s)pam, (k)eep, (q)uit\n")
 
     # Track changes
     changes: dict[str, list[str]] = {}  # filter_name -> list of added emails
     allowed_count = 0
     spammed_count = 0
     filtered_count = 0
+    skipped_count = 0
     should_quit = False
 
-    for i, (display_name, email) in enumerate(new_senders, 1):
-        prompt_text = f"[{i}/{len(new_senders)}] {display_name} <{email}>\n  [f]ilter / [a]llow / [s]pam / [q]uit: "
+    for i, (display_name, email, subject) in enumerate(new_senders, 1):
+        prompt_text = (
+            f"[{i}/{len(new_senders)}] {display_name} <{email}>\n"
+            f"  Subject: {subject}\n"
+            f"  [f]ilter / [a]llow / [s]pam / [k]eep / [q]uit: "
+        )
 
         while True:
             try:
@@ -692,6 +697,11 @@ def cmd_label(manager: FilterManager, args):
                 print("  -> Allowed (skipped)")
                 break
 
+            elif choice in ("k", "skip"):
+                skipped_count += 1
+                print("  -> Skipped (will appear next time)")
+                break
+
             elif choice in ("s", "spam"):
                 _add_to_spam(manager.config, email)
                 changes.setdefault("spam", []).append(email)
@@ -714,7 +724,7 @@ def cmd_label(manager: FilterManager, args):
                 break
 
             else:
-                print("  Invalid choice. Use f, a, s, or q.")
+                print("  Invalid choice. Use f, a, s, k, or q.")
 
         if should_quit:
             break
@@ -725,6 +735,7 @@ def cmd_label(manager: FilterManager, args):
     print(f"  Filtered: {filtered_count} sender(s)")
     print(f"  Allowed:  {allowed_count} sender(s)")
     print(f"  Spammed:  {spammed_count} sender(s)")
+    print(f"  Skipped:  {skipped_count} sender(s)")
 
     if not changes and allowed_count == 0:
         print("\nNo changes made.")

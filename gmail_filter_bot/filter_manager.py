@@ -538,12 +538,14 @@ class FilterManager:
                             break
 
                     # Delete only if this part changed
-                    if part_index not in change.unchanged_parts:
-                        if rf["id"] not in deleted_filter_ids:
-                            self.client.delete_filter(rf["id"])
-                            deleted_filter_ids.add(rf["id"])
-                            results["updated"] += 1
-                            deleted_count += 1
+                    if (
+                        part_index not in change.unchanged_parts
+                        and rf["id"] not in deleted_filter_ids
+                    ):
+                        self.client.delete_filter(rf["id"])
+                        deleted_filter_ids.add(rf["id"])
+                        results["updated"] += 1
+                        deleted_count += 1
 
         if deleted_count > 0:
             print(f"  ✓ Deleted {deleted_count} existing filter(s)")
