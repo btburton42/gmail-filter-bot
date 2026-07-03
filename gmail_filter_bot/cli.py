@@ -136,7 +136,8 @@ assign them to filters. Present each sender one by one:
   (f)ilter - assign to a filter (with autocomplete)
   (a)llow  - skip this sender (remembered, won't appear again)
   (s)pam   - add to spam (delete) filter and report as spam
-  (k)eep   - skip this sender for now (will appear again next time)
+  (k)      - skip this sender for now (will appear again next time)
+  (v)      - archive the current message
   (q)uit   - exit and proceed to summary
 
 After the session, changes are saved to filters.yaml and you'll be
@@ -598,9 +599,20 @@ def cmd_clean(manager: FilterManager, args):
         for group in format_results["consolidated"]:
             print(f"      - {group['name']}: {group['total_entries']} entries")
 
+    # Step 3: Sort filters alphabetically
+    print("\n  Step 3: Sorting filters alphabetically...")
+    before_order = list(manager.config.filters.keys())
+    manager.config.filters = dict(sorted(manager.config.filters.items()))
+    after_order = list(manager.config.filters.keys())
+    if before_order == after_order:
+        print("    ✓ Already sorted")
+    else:
+        print("    ✓ Sorted filters alphabetically")
+
     if dry_run:
         print("\n[DRY RUN] No changes saved.")
     else:
+        manager.config.save(manager.config_path)
         print(f"\nConfiguration saved to {manager.config_path}")
 
     return 0
@@ -642,7 +654,7 @@ def cmd_label(manager: FilterManager, args):
         return 0
 
     print(f"\n{len(new_senders)} sender(s) to triage.")
-    print("Commands: (f)ilter, (a)llow, (s)pam, (k)eep, (q)uit\n")
+    print("Commands: (f)ilter, (a)llow, (s)pam, (k) skip, (q)uit\n")
 
     # Track changes
     changes: dict[str, list[str]] = {}  # filter_name -> list of added emails
@@ -650,14 +662,23 @@ def cmd_label(manager: FilterManager, args):
     spammed_count = 0
     filtered_count = 0
     skipped_count = 0
+    archived_count = 0
     should_quit = False
 
-    for i, (display_name, email, subject) in enumerate(new_senders, 1):
-        prompt_text = (
-            f"[{i}/{len(new_senders)}] {display_name} <{email}>\n"
-            f"  Subject: {subject}\n"
-            f"  [f]ilter / [a]llow / [s]pam / [k]eep / [q]uit: "
-        )
+    for i, (display_name, email, subjects, msg_id) in enumerate(new_senders, 1):
+        if len(subjects) > 1:
+            subject_lines = "\n".join(f"  • {s}" for s in subjects)
+            prompt_text = (
+                f"[{i}/{len(new_senders)}] {display_name} <{email}>\n"
+                f"{subject_lines}\n"
+                f"  [f]ilter / [a]llow / [s]pam / [k] skip / [q]uit: "
+            )
+        else:
+            prompt_text = (
+                f"[{i}/{len(new_senders)}] {display_name} <{email}>\n"
+                f"  Subject: {subjects[0] if subjects else ''}\n"
+                f"  [f]ilter / [a]llow / [s]pam / [k] skip / [q]uit: "
+            )
 
         while True:
             try:
@@ -672,6 +693,28 @@ def cmd_label(manager: FilterManager, args):
                 if filter_name is None:
                     print("  Cancelled. Try again.")
                     continue
+                if filter_name == "__archive__":
+                    archived_count += 1
+                    from .config import FilterConfig
+
+                    if "archive" not in manager.config.filters:
+                        manager.config.filters["archive"] = FilterConfig(
+                            name="archive",
+                            action="archive",
+                            entries=[],
+                        )
+                    if email not in manager.config.filters["archive"].entries:
+                        manager.config.filters["archive"].entries.append(email)
+                        changes.setdefault("archive", []).append(email)
+                    print("  -> Archiving message...", end=" ", flush=True)
+                    try:
+                        if manager.client.archive_message(msg_id):
+                            print("done.")
+                        else:
+                            print("failed.")
+                    except Exception as e:
+                        print(f"error: {e}")
+                    break
                 if filter_name not in manager.config.filters:
                     from .config import FilterConfig
 
@@ -736,6 +779,7 @@ def cmd_label(manager: FilterManager, args):
     print(f"  Allowed:  {allowed_count} sender(s)")
     print(f"  Spammed:  {spammed_count} sender(s)")
     print(f"  Skipped:  {skipped_count} sender(s)")
+    print(f"  Archived: {archived_count} sender(s)")
 
     if not changes and allowed_count == 0:
         print("\nNo changes made.")
@@ -861,6 +905,16 @@ def _prompt_filter_selection(config, questionary_module):
     plus an "Other (type name)" option. If "Other" is chosen, falls back to
     autocomplete from all existing filter names.
     """
+    from prompt_toolkit.styles import Style
+
+    no_bg_style = Style.from_dict(
+        {
+            "selected": "",
+            "pointer": "",
+            "highlighted": "",
+        }
+    )
+
     filter_names = list(config.filters.keys())
 
     if not filter_names:
@@ -892,10 +946,18 @@ def _prompt_filter_selection(config, questionary_module):
             )
         )
 
+    choices.append(
+        questionary_module.Choice(
+            title="Archive (archive this message + future emails from sender)",
+            value="__archive__",
+        )
+    )
+
     try:
         choice = questionary_module.select(
             "  Select filter:",
             choices=choices,
+            style=no_bg_style,
         ).ask()
 
         if choice is None:
@@ -906,6 +968,7 @@ def _prompt_filter_selection(config, questionary_module):
             choice = questionary_module.autocomplete(
                 "  Type filter name:",
                 choices=filter_names,
+                style=no_bg_style,
             ).ask()
 
         return choice

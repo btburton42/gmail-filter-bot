@@ -262,10 +262,14 @@ class TestListSenders:
         assert "alice@example.com" in emails
         assert "bob@example.com" in emails
         assert len(emails) == 2
-        # Subject from first occurrence is kept
-        subjects = {s[1]: s[2] for s in senders}
-        assert subjects["alice@example.com"] == "Hello World"
-        assert subjects["bob@example.com"] == "Re: Project Update"
+        # All subjects are collected per sender
+        subjects_map = {s[1]: s[2] for s in senders}
+        assert subjects_map["alice@example.com"] == ["Hello World", "Another message"]
+        assert subjects_map["bob@example.com"] == ["Re: Project Update"]
+        # Message IDs are present (first occurrence)
+        msg_ids = {s[1]: s[3] for s in senders}
+        assert msg_ids["alice@example.com"] == "1"
+        assert msg_ids["bob@example.com"] == "2"
 
     def test_list_senders_respects_max_results(self):
         client = _make_mock_client()
@@ -388,6 +392,30 @@ class TestReportSpam:
 
         result = GmailClient.report_spam(client, [])
         assert result == 0
+
+
+class TestArchiveMessage:
+    """Tests for GmailClient.archive_message."""
+
+    def test_archive_success(self):
+        client = MagicMock()
+
+        result = GmailClient.archive_message(client, "msg123")
+        assert result is True
+        call_body = client.service.users().messages().batchModify.call_args[1]["body"]
+        assert call_body["ids"] == ["msg123"]
+        assert call_body["removeLabelIds"] == ["INBOX"]
+
+    def test_archive_http_error(self):
+        from googleapiclient.errors import HttpError
+
+        client = MagicMock()
+        client.service.users().messages().batchModify.side_effect = HttpError(
+            resp=MagicMock(status=500), content=b'{"error": "server error"}'
+        )
+
+        result = GmailClient.archive_message(client, "msg123")
+        assert result is False
 
 
 class TestResolveLabelId:

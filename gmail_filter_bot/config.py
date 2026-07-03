@@ -147,7 +147,7 @@ class Config:
         }
 
         if self.allowed:
-            data["allowed"] = self.allowed
+            data["allowed"] = sorted(self.allowed)
 
         data["filters"] = {}
 

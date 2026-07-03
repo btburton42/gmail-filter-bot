@@ -366,6 +366,25 @@ class GmailClient:
 
         return total_reported
 
+    def archive_message(self, message_id: str) -> bool:
+        """Archive a single message by removing it from the inbox.
+
+        Args:
+            message_id: Gmail message ID to archive
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.service.users().messages().batchModify(
+                userId="me",
+                body={"ids": [message_id], "removeLabelIds": ["INBOX"]},
+            ).execute()
+            return True
+        except HttpError as e:
+            print(f"Warning: Could not archive message {message_id}: {e}")
+            return False
+
     def list_labels(self) -> dict[str, str]:
         """List all labels in the Gmail account.
 
@@ -424,7 +443,9 @@ class GmailClient:
             return match.group(0)
         return from_header.strip()
 
-    def list_senders(self, label_id: str, max_results: int = 200) -> list[tuple[str, str, str]]:
+    def list_senders(
+        self, label_id: str, max_results: int = 200
+    ) -> list[tuple[str, str, list[str], str]]:
         """Fetch unique senders from messages with the given label.
 
         Args:
@@ -432,10 +453,11 @@ class GmailClient:
             max_results: Maximum number of recent messages to fetch
 
         Returns:
-            List of (display_name, email_address, subject) tuples, deduplicated
-            by email address, preserving order of first appearance.
+            List of (display_name, email_address, subjects, message_id) tuples,
+            where subjects is a list of all subjects seen for that sender,
+            deduplicated by email address, preserving order of first appearance.
         """
-        sender_map: dict[str, tuple[str, str]] = {}
+        sender_map: dict[str, tuple[str, list[str], str]] = {}
         fetched = 0
         page_token = None
 
@@ -484,13 +506,17 @@ class GmailClient:
 
                     if from_header:
                         email_addr = self._extract_email(from_header)
-                        if email_addr and email_addr not in sender_map:
+                        if email_addr:
                             display_name = from_header
                             if f"<{email_addr}>" in from_header:
                                 display_name = from_header.split("<")[0].strip().strip('"')
                             if not display_name:
                                 display_name = email_addr
-                            sender_map[email_addr] = (display_name, subject)
+                            if email_addr not in sender_map:
+                                sender_map[email_addr] = (display_name, [], msg["id"])
+                            sender_entry = sender_map[email_addr]
+                            if subject and subject not in sender_entry[1]:
+                                sender_entry[1].append(subject)
                 except HttpError:
                     continue
                 fetched += 1
@@ -499,4 +525,7 @@ class GmailClient:
             if not page_token:
                 break
 
-        return [(name, email, subject) for email, (name, subject) in sender_map.items()]
+        return [
+            (name, email, subjects, msg_id)
+            for email, (name, subjects, msg_id) in sender_map.items()
+        ]
