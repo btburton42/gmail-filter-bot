@@ -6,6 +6,8 @@ A Python CLI tool to sync and manage Gmail filters from a local YAML configurati
 
 - **Simple 3-command workflow**: `init`, `apply`, `clean`
 - **Smart sync**: Auto-detects which direction changes need to go (Gmail → local, local → Gmail, or both)
+- **Interactive labeling**: Triage senders one by one with `gfb label` — filter, allow, spam, skip, or archive
+- **Rollup labels**: Apply nested label hierarchies (e.g. `a/b/c` → `a` + `a/b` + `a/b/c`)
 - **Part-level optimization**: Only updates changed parts of split filters (saves time on large filters)
 - **Auto-split**: Automatically creates "filter-name", "filter-name-2", etc. when entry count exceeds limits
 - **Dry-run support**: Preview all changes before applying
@@ -134,16 +136,52 @@ Available actions:
 - `mark_not_important`: Mark as not important
 - `star`: Star messages
 
+### Rollup
+
+Rollup applies all ancestor labels in addition to the filter's label. For example, a filter with label `a/b/c` and rollup enabled will apply three labels: `a`, `a/b`, and `a/b/c`.
+
+Enable globally (applies to all filters):
+
+```yaml
+rollup: true
+
+filters:
+  automated/general:
+    action: label_only
+    label: automated/general
+    entries: [...]
+```
+
+Or per-filter (overrides global setting):
+
+```yaml
+filters:
+  automated/general:
+    action: label_only
+    label: automated/general
+    rollup: true
+    entries: [...]
+
+  work:
+    action: label_and_archive
+    label: work
+    rollup: false        # Explicitly disable, overrides global
+    entries: [...]
+```
+
+> **WARNING:** Rollup increases the number of labels applied to each message. In IMAP clients (Apple Mail, Thunderbird, etc.), each label appears as a separate folder. Messages with nested labels will show up in multiple folders, which uses more space and may make navigation more cluttered. Use rollup selectively if you rely on IMAP access.
+
 ## Usage
 
 ### Commands
 
 | Command | Description | Common Flags |
 |---------|-------------|--------------|
-| `init` | Import existing Gmail filters from your account into `filters.yaml`. **Run this first** to automatically create your config from Gmail. | `--dry-run`: Preview what would be imported |
-| `plan` | Preview what changes would be applied. Shows exactly what would happen during apply without making any changes. | `--push`: Show push plan only<br>`--sync`: Show sync plan only |
-| `apply` | **Main command** - syncs changes between local config and Gmail. Auto-detects direction and applies changes immediately. | `--push`: Force push local → Gmail only<br>`--sync`: Force sync Gmail → local only<br>`--no-apply-existing`: Skip labeling existing conversations |
+| `init` | Import existing Gmail filters from your account into `filters.yaml`. **Run this first** to automatically create your config from Gmail. | `--dry-run`: Preview what would be imported<br>`--rollup`: Enable global rollup in generated config |
+| `plan` | Preview what changes would be applied. Shows exactly what would happen during apply without making any changes. | `--push`: Show push plan only<br>`--pull`: Show pull plan only |
+| `apply` | **Main command** - syncs changes between local config and Gmail. Auto-detects direction and applies changes immediately. | `--push`: Force push local → Gmail only<br>`--pull`: Force pull Gmail → local only<br>`--no-apply-existing`: Skip labeling existing conversations |
 | `clean` | Optimize your configuration by removing duplicates and consolidating similar filters. | `--dry-run`: Preview changes |
+| `label` | Interactively triage email senders — filter, allow, spam, skip, or archive each one. | `[folder]`: Gmail label to scan (default: Inbox)<br>`--max-messages N`: Limit messages (default: 200)<br>`--rollup`: Fetch from all sub-labels |
 
 ### Quick Start
 
@@ -160,6 +198,11 @@ gmail-filter-bot apply
 
 # 4. Optimize configuration (remove duplicates, consolidate)
 gmail-filter-bot clean
+
+# 5. Interactively triage and label senders
+gmail-filter-bot label
+gmail-filter-bot label newsletters          # Triage a specific label
+gmail-filter-bot label automated --rollup   # Triage with sub-labels rolled up
 ```
 
 ### Detailed Examples
@@ -168,6 +211,9 @@ gmail-filter-bot clean
 ```bash
 # Import your existing Gmail filters
 gmail-filter-bot init
+
+# Enable global rollup during import
+gmail-filter-bot init --rollup
 
 # Preview first (recommended)
 gmail-filter-bot init --dry-run
@@ -178,19 +224,19 @@ gmail-filter-bot init --dry-run
 # Preview what would happen without making changes
 gmail-filter-bot plan
 
-# Preview specific direction
-gmail-filter-bot plan --push   # Show what would be pushed
-gmail-filter-bot plan --sync   # Show what would be synced
-```
+  # Preview specific direction
+  gmail-filter-bot plan --push   # Show what would be pushed
+  gmail-filter-bot plan --pull   # Show what would be pulled
+  ```
 
 **Apply changes:**
 ```bash
-# Auto-detect direction and sync (applies immediately)
-gmail-filter-bot apply
+  # Auto-detect direction and sync (applies immediately)
+  gmail-filter-bot apply
 
-# Force specific direction
-gmail-filter-bot apply --push   # Only push local changes
-gmail-filter-bot apply --sync   # Only pull Gmail changes
+  # Force specific direction
+  gmail-filter-bot apply --push   # Only push local changes
+  gmail-filter-bot apply --pull   # Only pull Gmail changes
 
 # Skip "apply to existing" step (don't label existing conversations)
 gmail-filter-bot apply --no-apply-existing

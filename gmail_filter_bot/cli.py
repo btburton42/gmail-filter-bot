@@ -50,6 +50,12 @@ Examples:
         action="store_true",
         help="Preview what would be imported",
     )
+    init_parser.add_argument(
+        "--rollup",
+        action="store_true",
+        default=False,
+        help="Enable global rollup in the generated config",
+    )
 
     # plan command - preview changes without applying
     plan_parser = subparsers.add_parser(
@@ -66,22 +72,22 @@ including which filters would be created, updated, or skipped.""",
         help="Show plan for push local → Gmail only",
     )
     plan_parser.add_argument(
-        "--sync",
+        "--pull",
         action="store_true",
-        help="Show plan for sync Gmail → local only",
+        help="Show plan for pull Gmail → local only",
     )
 
     # apply command - the main workflow
     apply_parser = subparsers.add_parser(
         "apply",
-        help="Apply configuration changes (sync, push, or both)",
+        help="Apply configuration changes (pull, push, or both)",
         description="""Apply changes between local config and Gmail.
 
 By default, this performs a two-way sync:
   - Pulls new/deleted entries from Gmail
   - Pushes local changes to Gmail
 
-Use --push or --sync to force a specific direction.
+Use --push or --pull to force a specific direction.
 
 WARNING: This command applies changes immediately without confirmation.
 Use 'plan' first to preview what would change.""",
@@ -89,12 +95,12 @@ Use 'plan' first to preview what would change.""",
     apply_parser.add_argument(
         "--push",
         action="store_true",
-        help="Force push local → Gmail (skip Gmail → local sync)",
+        help="Force push local → Gmail (skip Gmail → local pull)",
     )
     apply_parser.add_argument(
-        "--sync",
+        "--pull",
         action="store_true",
-        help="Force sync Gmail → local (skip local → Gmail push)",
+        help="Force pull Gmail → local (skip local → Gmail push)",
     )
     apply_parser.add_argument(
         "--no-apply-existing",
@@ -154,6 +160,13 @@ prompted to apply them to Gmail.""",
         type=int,
         default=200,
         help="Maximum number of recent messages to scan (default: 200)",
+    )
+    label_parser.add_argument(
+        "-r",
+        "--rollup",
+        action="store_true",
+        default=False,
+        help="Roll up all sub-labels into one view (e.g. 'a' matches 'a', 'a/b', 'a/b/c')",
     )
 
     args = parser.parse_args()
@@ -278,6 +291,8 @@ def cmd_init(credentials, client, args):
 
     if args.dry_run:
         print("\n[DRY RUN] The following filters would be created:")
+        if args.rollup:
+            print("\n  rollup: true (global)")
         for name, filter_data in filter_configs.items():
             print(f"\n  {name}:")
             print(f"    action: {filter_data['action']}")
@@ -291,6 +306,7 @@ def cmd_init(credentials, client, args):
         max_entries_per_filter=50,
         filters={},
         credentials=credentials,
+        rollup=args.rollup,
     )
 
     for name, filter_data in filter_configs.items():
@@ -365,7 +381,7 @@ def _classify_action(add_labels, remove_labels, client=None):
 def cmd_plan(manager: FilterManager, args):
     """Handle plan command - preview changes without applying."""
     force_push = args.push
-    force_sync = args.sync
+    force_pull = args.pull
 
     # Validate first
     print("Validating configuration...")
@@ -389,20 +405,22 @@ def cmd_plan(manager: FilterManager, args):
 
     # Classify changes
     push_changes = [
-        c for c in changes if c.has_entry_changes or c.action_changed or c.label_changed
+        c
+        for c in changes
+        if c.has_entry_changes or c.action_changed or c.label_changed or c.rollup_changed
     ]
 
     # Determine operation mode
-    if force_push and force_sync:
-        print("Error: Cannot use both --push and --sync")
+    if force_push and force_pull:
+        print("Error: Cannot use both --push and --pull")
         return 1
 
     if force_push:
         mode = "push"
-    elif force_sync:
+    elif force_pull:
         mode = "sync"
     else:
-        # Auto-detect: if there are remote-only changes, suggest sync
+        # Auto-detect: if there are remote-only changes, suggest pull
         has_remote_changes = any(c.remote_only for c in changes)
         has_local_changes = any(
             c.local_only or c.action_changed or c.label_changed for c in changes
@@ -441,6 +459,8 @@ def cmd_plan(manager: FilterManager, args):
             print("    ~ action changed")
         if change.label_changed:
             print("    ~ label changed")
+        if change.rollup_changed:
+            print("    ~ rollup changed")
 
     # Show push preview for detailed output
     if push_changes:
@@ -457,7 +477,7 @@ def cmd_plan(manager: FilterManager, args):
 def cmd_apply(manager: FilterManager, args):
     """Handle apply command - smart two-way sync."""
     force_push = args.push
-    force_sync = args.sync
+    force_pull = args.pull
     no_apply_existing = args.no_apply_existing
 
     # Validate first
@@ -482,21 +502,23 @@ def cmd_apply(manager: FilterManager, args):
 
     # Classify changes
     push_changes = [
-        c for c in changes if c.has_entry_changes or c.action_changed or c.label_changed
+        c
+        for c in changes
+        if c.has_entry_changes or c.action_changed or c.label_changed or c.rollup_changed
     ]
     sync_changes = [c for c in changes if c.has_entry_changes]
 
     # Determine operation mode
-    if force_push and force_sync:
-        print("Error: Cannot use both --push and --sync")
+    if force_push and force_pull:
+        print("Error: Cannot use both --push and --pull")
         return 1
 
     if force_push:
         mode = "push"
-    elif force_sync:
+    elif force_pull:
         mode = "sync"
     else:
-        # Auto-detect: if there are remote-only changes, suggest sync
+        # Auto-detect: if there are remote-only changes, suggest pull
         has_remote_changes = any(c.remote_only for c in changes)
         has_local_changes = any(
             c.local_only or c.action_changed or c.label_changed for c in changes
@@ -527,12 +549,14 @@ def cmd_apply(manager: FilterManager, args):
             print("    ~ action changed")
         if change.label_changed:
             print("    ~ label changed")
+        if change.rollup_changed:
+            print("    ~ rollup changed")
 
     # Execute operations
     results = {"synced": 0, "pushed": 0, "skipped": 0}
 
     if mode in ("sync", "both") and sync_changes:
-        print("\nSyncing Gmail → local...")
+        print("\nPulling Gmail → local...")
         for change in sync_changes:
             # Get remote entries for this filter
             remote_filters = manager.client.list_filters()
@@ -541,7 +565,7 @@ def cmd_apply(manager: FilterManager, args):
             # Update local filter with remote entries
             manager.config.filters[change.name].entries = sorted(remote_entries)
             results["synced"] += 1
-            print(f"  ✓ Synced {change.name}")
+            print(f"  ✓ Pulled {change.name}")
 
         # Save updated configuration
         manager.config.save(manager.config_path)
@@ -560,7 +584,7 @@ def cmd_apply(manager: FilterManager, args):
     print(f"\n{'=' * 50}")
     print("Summary:")
     if results["synced"]:
-        print(f"  Synced: {results['synced']} filter(s) from Gmail")
+        print(f"  Pulled: {results['synced']} filter(s) from Gmail")
     if results["pushed"]:
         print(f"  Pushed: {results['pushed']} filter(s) to Gmail")
     if results["skipped"]:
@@ -624,18 +648,51 @@ def cmd_label(manager: FilterManager, args):
 
     folder = args.folder
     max_messages = args.max_messages
+    rollup = args.rollup
 
-    print(f"Fetching unique senders from '{folder}' (up to {max_messages} messages)...")
+    if rollup:
+        all_labels = manager.client.list_labels()
+        folder_lower = folder.lower()
+        matched = [
+            name
+            for name in all_labels
+            if name.lower() == folder_lower or name.lower().startswith(folder_lower + "/")
+        ]
+        if not matched:
+            print(
+                f"Error: No labels matching '{folder}' (with sub-labels) found in Gmail.",
+                file=sys.stderr,
+            )
+            available = list(all_labels.keys())
+            if available:
+                print(f"\nAvailable labels: {', '.join(sorted(available))}", file=sys.stderr)
+            return 1
 
-    label_id = manager.client._resolve_label_id(folder)
-    if label_id is None:
-        print(f"Error: Label '{folder}' not found in Gmail.", file=sys.stderr)
-        available = list(manager.client.list_labels().keys())
-        if available:
-            print(f"\nAvailable labels: {', '.join(sorted(available))}", file=sys.stderr)
-        return 1
+        print(f"Rolling up {len(matched)} label(s): {', '.join(sorted(matched))}")
+        per_label = max(1, max_messages // len(matched))
+        senders = []
+        seen_emails = set()
+        for label_name in sorted(matched):
+            label_id = all_labels[label_name]
+            print(f"  Fetching from '{label_name}' (up to {per_label} messages)...")
+            label_senders = manager.client.list_senders(label_id, max_results=per_label)
+            for entry in label_senders:
+                email = entry[1]
+                if email not in seen_emails:
+                    seen_emails.add(email)
+                    senders.append(entry)
+    else:
+        print(f"Fetching unique senders from '{folder}' (up to {max_messages} messages)...")
 
-    senders = manager.client.list_senders(label_id, max_results=max_messages)
+        label_id = manager.client._resolve_label_id(folder)
+        if label_id is None:
+            print(f"Error: Label '{folder}' not found in Gmail.", file=sys.stderr)
+            available = list(manager.client.list_labels().keys())
+            if available:
+                print(f"\nAvailable labels: {', '.join(sorted(available))}", file=sys.stderr)
+            return 1
+
+        senders = manager.client.list_senders(label_id, max_results=max_messages)
 
     if not senders:
         print("No senders found.")
@@ -988,16 +1045,17 @@ Gmail Filter Bot - Command Reference
 Available Commands:
 
   init              Import existing Gmail filters into local config
-                    Usage: gmail-filter-bot init [--dry-run]
+                    Usage: gmail-filter-bot init [--dry-run] [--rollup]
 
   plan              Preview what changes would be applied
-                    Usage: gmail-filter-bot plan [--push] [--sync]
+                    Usage: gmail-filter-bot plan [--push] [--pull]
 
   apply             Sync changes between local config and Gmail
-                    Usage: gmail-filter-bot apply [--push] [--sync]
+                    Usage: gmail-filter-bot apply [--push] [--pull]
 
   label             Interactively triage and label email senders
                     Usage: gmail-filter-bot label [folder] [--max-messages N]
+                                      [--rollup]
 
   clean             Remove duplicates and optimize filter configuration
                     Usage: gmail-filter-bot clean [--dry-run]
@@ -1098,6 +1156,45 @@ Entry Formats:
   - Multiple domains: {@domain1.com, @domain2.com}
 
 The app automatically splits filters that exceed the entry limit.
+
+Rollup:
+======
+
+  Rollup applies all ancestor labels in addition to the filter's label.
+  For example, a filter with label "a/b/c" and rollup enabled will apply
+  three labels: "a", "a/b", and "a/b/c".
+
+  Enable globally (applies to all filters):
+
+    rollup: true
+
+    filters:
+      automated/general:
+        action: label_only
+        label: automated/general
+        entries: [...]
+
+  Or per-filter (overrides global setting):
+
+    filters:
+      automated/general:
+        action: label_only
+        label: automated/general
+        rollup: true
+        entries: [...]
+
+      work:
+        action: label_and_archive
+        label: work
+        rollup: false        # Explicitly disable, overrides global
+        entries: [...]
+
+  WARNING: Rollup increases the number of labels applied to each
+  message. In IMAP clients (Apple Mail, Thunderbird, etc.), each
+  label appears as a separate folder. Messages with nested labels
+  will show up in multiple folders, which uses more space and may
+  make navigation more cluttered. Use rollup selectively if you
+  rely on IMAP access.
 """)
 
     elif topic == "troubleshooting":

@@ -81,13 +81,31 @@ class GmailClient:
                 return []
             raise
 
+    @staticmethod
+    def _get_rollup_labels(label: str) -> list[str]:
+        """Compute all ancestor labels for a nested label.
+
+        Example:
+          "a/b/c" -> ["a", "a/b", "a/b/c"]
+          "automated/general" -> ["automated", "automated/general"]
+          "simple" -> ["simple"]
+        """
+        parts = label.split("/")
+        return ["/".join(parts[: i + 1]) for i in range(len(parts))]
+
     def create_filter(
         self,
         from_addresses: list[str],
         action: str,
         label: str | None = None,
+        rollup: bool = False,
     ) -> dict[str, Any]:
-        """Create a new filter."""
+        """Create a new filter.
+
+        When rollup is enabled, creates one filter per ancestor label
+        (Gmail limits one user label per filter). The deepest label gets
+        the full action; ancestors get label_only.
+        """
         # Filter out None values and ensure all entries are strings
         valid_addresses = [
             str(addr).strip() for addr in from_addresses if addr is not None and str(addr).strip()
@@ -99,6 +117,30 @@ class GmailClient:
         criteria = {
             "from": " OR ".join(valid_addresses),
         }
+
+        # If rollup is enabled with a label, create one filter per ancestor
+        if rollup and action in ["label_only", "label_and_archive"] and label:
+            rollup_labels = self._get_rollup_labels(label)
+            result = {}
+            for i, lbl in enumerate(rollup_labels):
+                is_last = i == len(rollup_labels) - 1
+                sub_action = action if is_last else "label_only"
+
+                sub_action_body = {"addLabelIds": [self._get_or_create_label(lbl)]}
+                if sub_action == "label_and_archive":
+                    sub_action_body["removeLabelIds"] = ["INBOX"]
+
+                result = (
+                    self.service.users()
+                    .settings()
+                    .filters()
+                    .create(
+                        userId="me",
+                        body={"criteria": criteria, "action": sub_action_body},
+                    )
+                    .execute()
+                )
+            return result
 
         # Build action
         action_body = {}
@@ -241,17 +283,17 @@ class GmailClient:
     def apply_label_to_existing(
         self,
         from_addresses: list[str],
-        label_id: str,
+        label_ids: list[str],
         archive: bool = False,
     ) -> int:
-        """Apply label to existing messages matching the from addresses.
+        """Apply label(s) to existing messages matching the from addresses.
 
         This mimics the "Also apply filter to X matching conversations" option
         in the Gmail web UI when creating a filter.
 
         Args:
             from_addresses: List of email addresses to search for
-            label_id: Label ID to apply
+            label_ids: List of label IDs to apply
             archive: Whether to also archive (remove from inbox)
 
         Returns:
@@ -295,7 +337,7 @@ class GmailClient:
 
                     body = {
                         "ids": chunk,
-                        "addLabelIds": [label_id],
+                        "addLabelIds": list(label_ids),
                     }
 
                     if archive:

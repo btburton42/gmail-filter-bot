@@ -26,13 +26,18 @@ class FilterChange:
     remote_only: set[str] = field(default_factory=set)
     action_changed: bool = False
     label_changed: bool = False
+    rollup_changed: bool = False
     unchanged_parts: set[int] = field(default_factory=set)
 
     @property
     def has_changes(self) -> bool:
         """Check if there are any differences between local and remote."""
         return bool(
-            self.local_only or self.remote_only or self.action_changed or self.label_changed
+            self.local_only
+            or self.remote_only
+            or self.action_changed
+            or self.label_changed
+            or self.rollup_changed
         )
 
     @property
@@ -187,12 +192,19 @@ class FilterManager:
             change = self.compare_filter_entries(local_entries, remote_entries)
             change.name = name
 
-            # Also check if action/label changed
+            # Also check if action/label/rollup changed
             remote_action, remote_label = self._get_remote_action_and_label(name, remote_filters)
             if remote_action and local_filter.action != remote_action:
                 change.action_changed = True
             if remote_label and local_filter.label != remote_label:
                 change.label_changed = True
+            remote_rollup = self._has_remote_rollup_filters(name, remote_filters)
+            if remote_rollup is not None:
+                local_rollup = (
+                    local_filter.rollup if local_filter.rollup is not None else self.config.rollup
+                )
+                if local_rollup != remote_rollup:
+                    change.rollup_changed = True
 
             if change.has_changes:
                 # For split filters, check which specific parts are unchanged
@@ -223,6 +235,13 @@ class FilterManager:
                         print(
                             f"    - Label changed: local='{local_filter.label}', remote='{remote_label}'"
                         )
+                    if change.rollup_changed:
+                        local_rollup = (
+                            local_filter.rollup
+                            if local_filter.rollup is not None
+                            else self.config.rollup
+                        )
+                        print(f"    - Rollup changed: local={local_rollup}, remote={remote_rollup}")
                     if change.unchanged_parts:
                         total_parts = (
                             entry_count + self.config.max_entries_per_filter - 1
@@ -253,6 +272,44 @@ class FilterManager:
                 label = self._extract_remote_label(rf)
                 return action, label
         return None, None
+
+    def _has_remote_rollup_filters(self, name: str, remote_filters: list[dict]) -> bool | None:
+        """Check if ancestor rollup filters exist remotely for a local filter.
+
+        Returns True if all expected ancestor filters exist, False if any
+        are missing, or None if rollup is not applicable (no nested label or
+        rollup not enabled locally).
+        """
+        filter_config = self.config.filters[name]
+        if not filter_config.label:
+            return None
+
+        effective_rollup = (
+            filter_config.rollup if filter_config.rollup is not None else self.config.rollup
+        )
+        if not effective_rollup:
+            return False
+
+        rollup_labels = GmailClient._get_rollup_labels(filter_config.label)
+        if len(rollup_labels) <= 1:
+            return None  # No ancestors, rollup is a no-op
+
+        ancestor_labels = rollup_labels[:-1]  # All except the deepest
+        local_entries = set(filter_config.entries)
+
+        for ancestor_label in ancestor_labels:
+            found = False
+            for rf in remote_filters:
+                rf_label = self._extract_remote_label(rf)
+                if rf_label and rf_label.lower() == ancestor_label.lower():
+                    rf_entries = set(self.client.parse_filter_entries(rf))
+                    if rf_entries & local_entries:
+                        found = True
+                        break
+            if not found:
+                return False
+
+        return True
 
     def _extract_remote_action(self, filter_obj: dict) -> str:
         """Extract action type from a remote filter object."""
@@ -591,13 +648,24 @@ class FilterManager:
                 # Only apply label to the NEW entries being added, not all entries
                 new_entries = list(change.local_only)
                 if new_entries:
-                    print(
-                        f"  → Applying label '{filter_config.label}' to {len(new_entries)} new conversation(s)..."
+                    effective_rollup = (
+                        filter_config.rollup
+                        if filter_config.rollup is not None
+                        else self.config.rollup
                     )
-                    label_id = self.client._get_or_create_label(filter_config.label)
+                    if effective_rollup:
+                        rollup_labels = self.client._get_rollup_labels(filter_config.label)
+                        label_ids = [self.client._get_or_create_label(lbl) for lbl in rollup_labels]
+                        label_desc = " + ".join(rollup_labels)
+                    else:
+                        label_ids = [self.client._get_or_create_label(filter_config.label)]
+                        label_desc = filter_config.label
+                    print(
+                        f"  → Applying label '{label_desc}' to {len(new_entries)} new conversation(s)..."
+                    )
                     archive = filter_config.action in ["label_and_archive", "archive"]
                     modified_count = self.client.apply_label_to_existing(
-                        new_entries, label_id, archive=archive
+                        new_entries, label_ids, archive=archive
                     )
                     results["applied_to_existing"] += modified_count
                     if modified_count > 0:
@@ -652,10 +720,14 @@ class FilterManager:
         entries: list[str],
     ) -> None:
         """Create a single filter with given entries."""
+        effective_rollup = (
+            filter_config.rollup if filter_config.rollup is not None else self.config.rollup
+        )
         self.client.create_filter(
             from_addresses=entries,
             action=filter_config.action,
             label=filter_config.label,
+            rollup=effective_rollup,
         )
 
     def _extract_base_name(self, filter_obj: dict) -> str:

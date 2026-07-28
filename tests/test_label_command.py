@@ -418,6 +418,147 @@ class TestArchiveMessage:
         assert result is False
 
 
+class TestGetRollupLabels:
+    """Tests for GmailClient._get_rollup_labels."""
+
+    def test_single_level(self):
+        assert GmailClient._get_rollup_labels("simple") == ["simple"]
+
+    def test_two_levels(self):
+        assert GmailClient._get_rollup_labels("a/b") == ["a", "a/b"]
+
+    def test_three_levels(self):
+        assert GmailClient._get_rollup_labels("a/b/c") == ["a", "a/b", "a/b/c"]
+
+    def test_automated_general(self):
+        assert GmailClient._get_rollup_labels("automated/general") == [
+            "automated",
+            "automated/general",
+        ]
+
+
+class TestCreateFilterRollup:
+    """Tests that create_filter with rollup creates one filter per ancestor."""
+
+    def test_rollup_creates_multiple_filters(self):
+        client = MagicMock()
+        client._get_or_create_label.side_effect = lambda lbl: f"Label_{lbl}"
+        client._get_rollup_labels = GmailClient._get_rollup_labels
+
+        GmailClient.create_filter(
+            client,
+            from_addresses=["a@example.com"],
+            action="label_and_archive",
+            label="automated/general",
+            rollup=True,
+        )
+
+        # Should create 2 filters: one for "automated" (label_only) and one for
+        # "automated/general" (label_and_archive)
+        assert client.service.users().settings().filters().create.call_count == 2
+
+        calls = client.service.users().settings().filters().create.call_args_list
+        # First call: ancestor "automated" - label_only (no INBOX removal)
+        first_body = calls[0][1]["body"]
+        assert first_body["action"]["addLabelIds"] == ["Label_automated"]
+        assert "removeLabelIds" not in first_body["action"]
+
+        # Second call: deepest "automated/general" - label_and_archive
+        second_body = calls[1][1]["body"]
+        assert second_body["action"]["addLabelIds"] == ["Label_automated/general"]
+        assert second_body["action"]["removeLabelIds"] == ["INBOX"]
+
+    def test_rollup_three_levels(self):
+        client = MagicMock()
+        client._get_or_create_label.side_effect = lambda lbl: f"Label_{lbl}"
+        client._get_rollup_labels = GmailClient._get_rollup_labels
+
+        GmailClient.create_filter(
+            client,
+            from_addresses=["a@example.com"],
+            action="label_only",
+            label="a/b/c",
+            rollup=True,
+        )
+
+        assert client.service.users().settings().filters().create.call_count == 3
+
+    def test_no_rollup_creates_single_filter(self):
+        client = MagicMock()
+        client._get_or_create_label.return_value = "Label_1"
+        client._get_rollup_labels = GmailClient._get_rollup_labels
+
+        GmailClient.create_filter(
+            client,
+            from_addresses=["a@example.com"],
+            action="label_only",
+            label="simple",
+            rollup=False,
+        )
+
+        assert client.service.users().settings().filters().create.call_count == 1
+
+    """Tests for Config.rollup field."""
+
+    def test_config_defaults_rollup_false(self, mock_credentials):
+        config = Config(
+            max_entries_per_filter=50,
+            filters={},
+            credentials=mock_credentials,
+        )
+        assert config.rollup is False
+
+    def test_config_loads_rollup(self, mock_credentials, tmp_path):
+        import yaml as yaml_module
+
+        config_data = {
+            "max_entries_per_filter": 50,
+            "rollup": True,
+            "filters": {},
+        }
+        config_file = tmp_path / "filters.yaml"
+        cred_file = tmp_path / ".env"
+        cred_file.write_text("GOOGLE_CLIENT_ID=test\nGOOGLE_CLIENT_SECRET=test\n")
+
+        with open(config_file, "w") as f:
+            yaml_module.dump(config_data, f)
+
+        config = Config.load(config_file, cred_file)
+        assert config.rollup is True
+
+    def test_config_saves_rollup(self, mock_credentials, tmp_path):
+        import yaml as yaml_module
+
+        config = Config(
+            max_entries_per_filter=50,
+            filters={},
+            credentials=mock_credentials,
+            rollup=True,
+        )
+        config_file = tmp_path / "filters.yaml"
+        config.save(config_file)
+
+        with open(config_file) as f:
+            data = yaml_module.safe_load(f)
+        assert data["rollup"] is True
+
+    def test_config_save_omits_false_rollup(self, mock_credentials, tmp_path):
+        import yaml as yaml_module
+
+        config = Config(
+            max_entries_per_filter=50,
+            filters={},
+            credentials=mock_credentials,
+            rollup=False,
+        )
+        config_file = tmp_path / "filters.yaml"
+        config.save(config_file)
+
+        with open(config_file) as f:
+            data = yaml_module.safe_load(f)
+        assert "rollup" not in data
+
+
 class TestResolveLabelId:
     """Tests for GmailClient._resolve_label_id."""
 

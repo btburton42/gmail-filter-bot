@@ -1233,3 +1233,99 @@ class TestScrambledFilters:
 
         assert action is None
         assert label is None
+
+    def test_has_remote_rollup_filters_ancestors_present(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test _has_remote_rollup_filters returns True when ancestor filters exist."""
+        mock_config.filters["automated/bills"] = FilterConfig(
+            name="automated/bills",
+            action="label_and_archive",
+            label="automated/bills",
+            entries=["a@example.com", "b@example.com"],
+        )
+        mock_config.rollup = True
+
+        mock_gmail_client.get_label_name.side_effect = lambda lid: {
+            "Label_1": "automated",
+            "Label_2": "automated/bills",
+        }.get(lid)
+        mock_gmail_client.parse_filter_entries.side_effect = lambda rf: rf.get("_entries", [])
+
+        remote_filters = [
+            {
+                "id": "f1",
+                "criteria": {"from": "a@example.com OR b@example.com"},
+                "action": {"addLabelIds": ["Label_1"]},  # ancestor "automated"
+                "_entries": ["a@example.com", "b@example.com"],
+            },
+            {
+                "id": "f2",
+                "criteria": {"from": "a@example.com OR b@example.com"},
+                "action": {"addLabelIds": ["Label_2"], "removeLabelIds": ["INBOX"]},
+                "_entries": ["a@example.com", "b@example.com"],
+            },
+        ]
+
+        result = filter_manager._has_remote_rollup_filters("automated/bills", remote_filters)
+        assert result is True
+
+    def test_has_remote_rollup_filters_ancestors_missing(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test _has_remote_rollup_filters returns False when ancestor filters missing."""
+        mock_config.filters["automated/bills"] = FilterConfig(
+            name="automated/bills",
+            action="label_and_archive",
+            label="automated/bills",
+            entries=["a@example.com"],
+        )
+        mock_config.rollup = True
+
+        mock_gmail_client.get_label_name.side_effect = lambda lid: {
+            "Label_2": "automated/bills",
+        }.get(lid)
+        mock_gmail_client.parse_filter_entries.side_effect = lambda rf: rf.get("_entries", [])
+
+        # Only the deepest filter exists, no ancestor
+        remote_filters = [
+            {
+                "id": "f2",
+                "criteria": {"from": "a@example.com"},
+                "action": {"addLabelIds": ["Label_2"], "removeLabelIds": ["INBOX"]},
+                "_entries": ["a@example.com"],
+            },
+        ]
+
+        result = filter_manager._has_remote_rollup_filters("automated/bills", remote_filters)
+        assert result is False
+
+    def test_has_remote_rollup_filters_no_nested_label(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test _has_remote_rollup_filters returns None for non-nested labels."""
+        mock_config.filters["work"] = FilterConfig(
+            name="work",
+            action="label_and_archive",
+            label="work",
+            entries=["a@example.com"],
+        )
+        mock_config.rollup = True
+
+        result = filter_manager._has_remote_rollup_filters("work", [])
+        assert result is None
+
+    def test_has_remote_rollup_filters_rollup_disabled(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Test _has_remote_rollup_filters returns False when rollup not enabled."""
+        mock_config.filters["automated/bills"] = FilterConfig(
+            name="automated/bills",
+            action="label_and_archive",
+            label="automated/bills",
+            entries=["a@example.com"],
+        )
+        mock_config.rollup = False
+
+        result = filter_manager._has_remote_rollup_filters("automated/bills", [])
+        assert result is False

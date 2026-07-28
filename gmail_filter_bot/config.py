@@ -14,6 +14,7 @@ class FilterConfig:
     action: str
     label: str | None = None
     entries: list[str] = None
+    rollup: bool | None = None
 
     def __post_init__(self):
         if self.entries is None:
@@ -89,6 +90,7 @@ class Config:
     filters: dict[str, FilterConfig]
     credentials: Credentials
     allowed: list[str] = None
+    rollup: bool = False
 
     def __post_init__(self):
         if self.allowed is None:
@@ -128,6 +130,7 @@ class Config:
                 action=filter_data.get("action", "label_only"),
                 label=filter_data.get("label"),
                 entries=filter_data.get("entries", []),
+                rollup=filter_data.get("rollup"),
             )
 
         # Parse allowed list
@@ -138,6 +141,7 @@ class Config:
             filters=filters,
             credentials=credentials,
             allowed=allowed,
+            rollup=data.get("rollup", False),
         )
 
     def save(self, path: Path):
@@ -145,6 +149,9 @@ class Config:
         data: dict = {
             "max_entries_per_filter": self.max_entries_per_filter,
         }
+
+        if self.rollup:
+            data["rollup"] = True
 
         if self.allowed:
             data["allowed"] = sorted(self.allowed)
@@ -158,6 +165,8 @@ class Config:
             }
             if filter_config.label:
                 filter_data["label"] = filter_config.label
+            if filter_config.rollup is not None:
+                filter_data["rollup"] = filter_config.rollup
             data["filters"][name] = filter_data
 
         with open(path, "w") as f:
