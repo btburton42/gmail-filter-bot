@@ -17,19 +17,26 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
 ]
 dependencies = [
     "google-api-python-client>=2.100.0",
     "google-auth-httplib2>=0.1.1",
     "google-auth-oauthlib>=1.0.0",
     "pyyaml>=6.0.1",
-    "questionary>=2.1.0",
+    "textual>=8.2,<9",
 ]
 
 [project.optional-dependencies]
+# Nothing here yet. Development dependencies live in the PEP 735 dev group below,
+# so `uv sync` installs them by default instead of silently leaving them out.
+
+[dependency-groups]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-asyncio>=1.0.0",
     "ruff>=0.1.0",
     "mypy>=1.6.0",
     "types-pyyaml>=6.0.12",
@@ -50,6 +57,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gmail_filter_bot"]
+
+[tool.uv]
+# `dev` is uv's default group already; stating it keeps `uv sync` honest if
+# someone runs it with UV_NO_DEV set in their environment.
+default-groups = ["dev"]
 
 [tool.ruff]
 target-version = "py310"

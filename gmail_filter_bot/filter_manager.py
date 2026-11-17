@@ -1,11 +1,51 @@
 """Filter management logic for Gmail Filter Bot."""
 
+from __future__ import annotations
+
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .config import Config, FilterConfig
 from .gmail_client import GmailClient
+
+# Entry format patterns used by doctor checks.
+# A valid entry is one of:
+#   - a concrete email:        user@example.com
+#   - a *@domain wildcard:     *@example.com
+#   - a bare-domain wildcard:  *example.com
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_WILDCARD_AT_DOMAIN_RE = re.compile(r"^\*@[^@\s]+\.[^@\s]+$")
+_BARE_DOMAIN_WILDCARD_RE = re.compile(r"^\*[^@\s]+\.[^@\s]+$")
+
+
+def _classify_entry(entry: str) -> str:
+    """Classify a filter entry string.
+
+    Returns one of: "email", "at_wildcard", "bare_wildcard", "malformed".
+    """
+    if _BARE_DOMAIN_WILDCARD_RE.match(entry):
+        return "bare_wildcard"
+    if _WILDCARD_AT_DOMAIN_RE.match(entry):
+        return "at_wildcard"
+    if _EMAIL_RE.match(entry):
+        return "email"
+    return "malformed"
+
+
+def _entry_domain(entry: str) -> str | None:
+    """Return the domain portion of an entry, or None if it has none.
+
+    For "user@example.com" -> "example.com".
+    For "*@example.com"   -> "example.com".
+    For "*example.com"     -> "example.com".
+    """
+    if "@" in entry:
+        return entry.rsplit("@", 1)[-1]
+    if entry.startswith("*"):
+        return entry[1:]
+    return None
 
 
 @dataclass
@@ -129,6 +169,443 @@ class FilterManager:
             "total_filters": len(self.config.filters),
             "total_entries": total_entries,
         }
+
+    def diagnose(self) -> list[dict[str, Any]]:
+        """Run local (offline) health checks on the configuration.
+
+        Returns a list of check result dicts, each with:
+            {"name": str, "level": "pass"|"warn"|"fail",
+             "message": str, "details": list[str]}
+
+        These checks never touch the network and are safe to unit test
+        with a mocked (or None) Gmail client.
+        """
+        checks: list[dict[str, Any]] = []
+
+        # --- 1. Structural validation (actions + labels) ---
+        validation = self.validate()
+        if validation["valid"]:
+            checks.append(
+                {
+                    "name": "config_validation",
+                    "level": "pass",
+                    "message": (
+                        f"Configuration valid ({validation['total_filters']} filters, "
+                        f"{validation['total_entries']} entries)"
+                    ),
+                    "details": [],
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "config_validation",
+                    "level": "fail",
+                    "message": f"{len(validation['errors'])} validation error(s)",
+                    "details": validation["errors"],
+                }
+            )
+
+        # --- 2. Empty filters ---
+        empty = [n for n, f in self.config.filters.items() if not f.entries]
+        if empty:
+            checks.append(
+                {
+                    "name": "empty_filters",
+                    "level": "warn",
+                    "message": f"{len(empty)} filter(s) have no entries",
+                    "details": empty,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "empty_filters",
+                    "level": "pass",
+                    "message": "No empty filters",
+                    "details": [],
+                }
+            )
+
+        # --- 3. Malformed entries (e.g. embedded whitespace) ---
+        malformed: list[str] = []
+        for name, f in self.config.filters.items():
+            for e in f.entries:
+                if _classify_entry(e) == "malformed":
+                    malformed.append(f"{name}: {e}")
+        if malformed:
+            checks.append(
+                {
+                    "name": "malformed_entries",
+                    "level": "fail",
+                    "message": f"{len(malformed)} malformed entry(s) found",
+                    "details": malformed,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "malformed_entries",
+                    "level": "pass",
+                    "message": "All entries well-formed",
+                    "details": [],
+                }
+            )
+
+        # --- 4. Near-split filters (>80% of the per-filter limit) ---
+        threshold = int(self.config.max_entries_per_filter * 0.8)
+        near = [
+            f"{n}: {len(f.entries)}/{self.config.max_entries_per_filter} entries"
+            for n, f in self.config.filters.items()
+            if threshold < len(f.entries) <= self.config.max_entries_per_filter
+        ]
+        if near:
+            checks.append(
+                {
+                    "name": "near_split",
+                    "level": "warn",
+                    "message": f"{len(near)} filter(s) close to the split limit",
+                    "details": near,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "near_split",
+                    "level": "pass",
+                    "message": "No filters near the split limit",
+                    "details": [],
+                }
+            )
+
+        # --- 5. Exact duplicates within a single filter ---
+        within_dupes: list[str] = []
+        for name, f in self.config.filters.items():
+            seen: set[str] = set()
+            for e in f.entries:
+                if e in seen:
+                    within_dupes.append(f"{name}: {e}")
+                seen.add(e)
+        if within_dupes:
+            # de-duplicate the report lines while keeping them readable
+            within_dupes = sorted(set(within_dupes))
+            checks.append(
+                {
+                    "name": "within_filter_duplicates",
+                    "level": "warn",
+                    "message": f"{len(within_dupes)} duplicate entry(s) within a single filter",
+                    "details": within_dupes,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "within_filter_duplicates",
+                    "level": "pass",
+                    "message": "No within-filter duplicates",
+                    "details": [],
+                }
+            )
+
+        # --- 6. Wildcard shadowing within a filter ---
+        # A specific address or *@domain is redundant when a broader wildcard
+        # in the same filter already covers it.
+        shadowing: list[str] = []
+        for name, f in self.config.filters.items():
+            bare_domains = [
+                e[1:] for e in f.entries if _classify_entry(e) == "bare_wildcard"
+            ]
+            at_domains = [
+                e[2:] for e in f.entries if _classify_entry(e) == "at_wildcard"
+            ]
+            for e in f.entries:
+                cls = _classify_entry(e)
+                if cls not in ("email", "at_wildcard"):
+                    continue
+                dom = _entry_domain(e)
+                if dom is None:
+                    continue
+                covered_by = None
+                # bare-domain wildcard *B covers dom == B or *.B (subdomain)
+                for b in bare_domains:
+                    if dom == b or dom.endswith("." + b):
+                        covered_by = f"*{b}"
+                        break
+                # *@B covers a concrete email user@B
+                if covered_by is None and cls == "email":
+                    for b in at_domains:
+                        if dom == b:
+                            covered_by = f"*@{b}"
+                            break
+                if covered_by is not None:
+                    shadowing.append(f"{name}: {e} (covered by {covered_by})")
+        if shadowing:
+            checks.append(
+                {
+                    "name": "wildcard_shadowing",
+                    "level": "warn",
+                    "message": f"{len(shadowing)} entry(s) shadowed by a wildcard in the same filter",
+                    "details": shadowing,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "wildcard_shadowing",
+                    "level": "pass",
+                    "message": "No wildcard shadowing within filters",
+                    "details": [],
+                }
+            )
+
+        # --- 7. Exact duplicates across filters ---
+        # Warn for plain redundancy; escalate to a hard failure when the
+        # competing filters use different actions (a silent precedence
+        # conflict resolved by Gmail's filter order). Entries that appear in a
+        # rollup filter are excluded: stacking onto a rollup filter is
+        # intentional, so any resulting overlap (same- or different-action) is
+        # just a consequence of rollup, not a conflict.
+        cross_dupes, cross_conflicts = self._cross_filter_findings()
+        if cross_conflicts:
+            checks.append(
+                {
+                    "name": "cross_filter_duplicates",
+                    "level": "fail",
+                    "message": (
+                        f"{len(cross_conflicts)} entry(s) in multiple filters with "
+                        f"CONFLICTING actions"
+                    ),
+                    "details": sorted(cross_conflicts),
+                }
+            )
+        elif cross_dupes:
+            checks.append(
+                {
+                    "name": "cross_filter_duplicates",
+                    "level": "warn",
+                    "message": (
+                        f"{len(cross_dupes)} entry(s) duplicated across filters "
+                        f"(same action)"
+                    ),
+                    "details": sorted(cross_dupes),
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "cross_filter_duplicates",
+                    "level": "pass",
+                    "message": "No entries duplicated across filters",
+                    "details": [],
+                }
+            )
+
+        return checks
+
+    def _is_rollup_filter(self, name: str) -> bool:
+        """True if `name` is a rollup filter.
+
+        A filter is a rollup when the *global* ``Config.rollup`` flag is set
+        (every filter rolls up) or when the filter itself has ``rollup: True``.
+        """
+        if getattr(self.config, "rollup", False):
+            return True
+        f = self.config.filters.get(name)
+        return bool(f is not None and getattr(f, "rollup", False))
+
+    def _rollup_entries(self) -> set[str]:
+        """Return the set of entries that belong to at least one rollup filter.
+
+        When the global ``Config.rollup`` flag is set, every filter rolls up, so
+        this returns the union of all entries.
+        """
+        rollup_entries: set[str] = set()
+        for name, f in self.config.filters.items():
+            if self._is_rollup_filter(name):
+                rollup_entries.update(f.entries)
+        return rollup_entries
+
+    def _cross_filter_findings(self) -> tuple[list[str], list[str]]:
+        """Compute cross-filter duplicate findings, excluding rollup entries.
+
+        Returns ``(cross_dupes, cross_conflicts)`` where each is a list of
+        human-readable detail lines. Entries that appear in any rollup filter
+        are skipped entirely (see ``diagnose`` for the rationale).
+        """
+        rollup_entries = self._rollup_entries()
+
+        entry_locations: dict[str, list[tuple[str, str]]] = {}
+        for name, f in self.config.filters.items():
+            for e in f.entries:
+                if e in rollup_entries:
+                    continue
+                entry_locations.setdefault(e, []).append((name, f.action))
+
+        cross_dupes: list[str] = []
+        cross_conflicts: list[str] = []
+        for e, locs in entry_locations.items():
+            names = [n for n, _ in locs]
+            if len(set(names)) <= 1:
+                continue
+            actions = sorted({a for _, a in locs})
+            line = f"{e} in {', '.join(f'{n}({a})' for n, a in locs)}"
+            if len(actions) > 1:
+                cross_conflicts.append(line)
+            else:
+                cross_dupes.append(line)
+        return cross_dupes, cross_conflicts
+
+    # Diagnosis types that `doctor resolve` knows how to auto-fix.
+    RESOLVABLE_CHECKS = (
+        "wildcard_shadowing",
+        "within_filter_duplicates",
+        "cross_filter_duplicates",
+    )
+
+    def resolve(self, check_name: str) -> dict[str, Any]:
+        """Attempt to auto-fix one diagnosis type in-place.
+
+        Re-runs ``diagnose`` to confirm the check is currently failing, then
+        applies the matching resolver and saves the config. Returns a result
+        dict::
+
+            {"resolved": bool, "reason": str, "fixed": int, "details": list[str]}
+        """
+        checks = self.diagnose()
+        target = next((c for c in checks if c["name"] == check_name), None)
+        if target is None:
+            return {"resolved": False, "reason": f"No check named '{check_name}'",
+                    "fixed": 0, "details": []}
+        if target["level"] == "pass":
+            return {"resolved": False, "reason": f"'{check_name}' is already passing",
+                    "fixed": 0, "details": []}
+        if check_name not in self.RESOLVABLE_CHECKS:
+            return {
+                "resolved": False,
+                "reason": (
+                    f"No auto-resolver for '{check_name}'. Resolvable types: "
+                    f"{', '.join(self.RESOLVABLE_CHECKS)}"
+                ),
+                "fixed": 0,
+                "details": [],
+            }
+
+        if check_name == "wildcard_shadowing":
+            fixed, details = self._resolve_wildcard_shadowing()
+        elif check_name == "within_filter_duplicates":
+            fixed, details = self._resolve_within_filter_duplicates()
+        else:  # cross_filter_duplicates
+            fixed, details = self._resolve_cross_filter_duplicates()
+            if fixed < 0:
+                # Negative signals an unresolvable (conflicting) case.
+                return {
+                    "resolved": False,
+                    "reason": (
+                        "conflicting actions across filters require manual "
+                        "resolution (mark a rollup filter with `rollup: true` "
+                        "if the overlap is intentional)"
+                    ),
+                    "fixed": 0,
+                    "details": [],
+                }
+
+        if fixed > 0:
+            self.config.save(self.config_path)
+        return {
+            "resolved": fixed > 0,
+            "reason": "" if fixed > 0 else "nothing to fix",
+            "fixed": fixed,
+            "details": details,
+        }
+
+    def _resolve_wildcard_shadowing(self) -> tuple[int, list[str]]:
+        """Remove entries shadowed by a wildcard within the same filter."""
+        removed = 0
+        details: list[str] = []
+        for name, f in self.config.filters.items():
+            bare_domains = [
+                e[1:] for e in f.entries if _classify_entry(e) == "bare_wildcard"
+            ]
+            at_domains = [
+                e[2:] for e in f.entries if _classify_entry(e) == "at_wildcard"
+            ]
+            to_remove: list[str] = []
+            for e in f.entries:
+                cls = _classify_entry(e)
+                if cls not in ("email", "at_wildcard"):
+                    continue
+                dom = _entry_domain(e)
+                if dom is None:
+                    continue
+                covered_by = None
+                for b in bare_domains:
+                    if dom == b or dom.endswith("." + b):
+                        covered_by = f"*{b}"
+                        break
+                if covered_by is None and cls == "email":
+                    for b in at_domains:
+                        if dom == b:
+                            covered_by = f"*@{b}"
+                            break
+                if covered_by is not None:
+                    to_remove.append(e)
+            for e in to_remove:
+                if e in f.entries:
+                    f.entries.remove(e)
+                    removed += 1
+                    details.append(f"{name}: removed {e}")
+        return removed, details
+
+    def _resolve_within_filter_duplicates(self) -> tuple[int, list[str]]:
+        """Deduplicate entries within each filter, preserving first order."""
+        removed = 0
+        details: list[str] = []
+        for name, f in self.config.filters.items():
+            seen: set[str] = set()
+            unique: list[str] = []
+            for e in f.entries:
+                if e in seen:
+                    removed += 1
+                    details.append(f"{name}: removed duplicate {e}")
+                    continue
+                seen.add(e)
+                unique.append(e)
+            f.entries = unique
+        return removed, details
+
+    def _resolve_cross_filter_duplicates(self) -> tuple[int, list[str]]:
+        """Remove same-action duplicates across filters, keeping the first.
+
+        Returns a negative ``fixed`` count when the overlap involves
+        conflicting actions (which cannot be auto-resolved).
+        """
+        cross_dupes, cross_conflicts = self._cross_filter_findings()
+        if cross_conflicts:
+            return -1, []
+        if not cross_dupes:
+            return 0, []
+
+        rollup_entries = self._rollup_entries()
+        # entry -> ordered list of filter names containing it (excl. rollup)
+        entry_names: dict[str, list[str]] = {}
+        for name, f in self.config.filters.items():
+            for e in f.entries:
+                if e in rollup_entries:
+                    continue
+                entry_names.setdefault(e, []).append(name)
+
+        removed = 0
+        details: list[str] = []
+        for e, names in entry_names.items():
+            if len(set(names)) <= 1:
+                continue
+            keep = names[0]  # first filter in config order
+            for n in names[1:]:
+                if e in self.config.filters[n].entries:
+                    self.config.filters[n].entries.remove(e)
+                    removed += 1
+                    details.append(f"{n}: removed {e} (kept in {keep})")
+        return removed, details
 
     def compare_filter_entries(
         self, local_entries: set[str], remote_entries: set[str]
@@ -384,71 +861,73 @@ class FilterManager:
         entries = filter_config.entries
         max_per_filter = self.config.max_entries_per_filter
 
-        # Split local entries into parts
+        # Split local entries into ordered parts.
         local_parts = self._split_entries(entries, max_per_filter)
+        local_sets = [frozenset(p) for p in local_parts]
+
+        # Collect remote parts attributed to this filter, with their entry sets.
+        remote_parts: list[tuple[dict, frozenset[str]]] = []
+        for rf in remote_filters:
+            if self._attribute_remote_part(rf) == name:
+                remote_parts.append((rf, frozenset(self.client.parse_filter_entries(rf))))
 
         unchanged_parts: set[int] = set()
+        consumed = [False] * len(remote_parts)
 
-        # Group remote filters by part name
-        remote_by_part: dict[str, dict] = {}
-        for rf in remote_filters:
-            base_name = self._match_filter_to_local(rf)
-            if base_name == name:
-                # Extract part name from the remote filter
-                rf_entries = self.client.parse_filter_entries(rf)
-                # Try to match to a part by entry overlap
-                for i, local_part in enumerate(local_parts, 1):
-                    part_name = name if i == 1 else f"{name}-{i}"
-                    local_part_set = set(local_part)
-                    remote_part_set = set(rf_entries)
-                    # If they share entries, this is that part
-                    if local_part_set & remote_part_set:
-                        remote_by_part[part_name] = rf
-                        break
-
-        # Compare each local part to its remote counterpart
-        for i, local_part in enumerate(local_parts, 1):
+        # A local part is unchanged when some unconsumed remote part has the
+        # same (action, label) AND an identical entry set. Matching is
+        # order-agnostic: a part matches any remote part with the same set, so
+        # Gmail reordering parts no longer causes spurious churn.
+        for i, local_set in enumerate(local_sets, 1):
             part_name = name if i == 1 else f"{name}-{i}"
-            local_part_set = set(local_part)
-
-            if part_name in remote_by_part:
-                rf = remote_by_part[part_name]
-                remote_entries = set(self.client.parse_filter_entries(rf))
-
-                # Check if action/label matches
+            for j, (rf, remote_set) in enumerate(remote_parts):
+                if consumed[j]:
+                    continue
                 remote_action = self._extract_remote_action(rf)
                 remote_label = self._extract_remote_label(rf)
-                action_match = filter_config.action == remote_action
-                label_match = filter_config.label == remote_label
-
-                # Check if entries match exactly
-                entries_match = local_part_set == remote_entries
-
-                if entries_match and action_match and label_match:
+                if (
+                    filter_config.action == remote_action
+                    and filter_config.label == remote_label
+                    and local_set == remote_set
+                ):
                     unchanged_parts.add(i)
+                    consumed[j] = True
                     if verbose:
                         print(
-                            f"    [DEBUG] Part '{part_name}' unchanged ({len(local_part)} entries)"
+                            f"    [DEBUG] Part '{part_name}' unchanged "
+                            f"({len(local_parts[i - 1])} entries)"
                         )
-                elif verbose:
-                    if not entries_match:
-                        local_only = local_part_set - remote_entries
-                        remote_only = remote_entries - local_part_set
+                    break
+            else:
+                if verbose:
+                    # Diagnose why this part changed.
+                    matched = next(
+                        (j for j in range(len(remote_parts)) if not consumed[j]),
+                        None,
+                    )
+                    if matched is None:
+                        print(f"    [DEBUG] Part '{part_name}' not found remotely (new)")
+                    else:
+                        rf, remote_set = remote_parts[matched]
+                        local_only = local_set - remote_set
+                        remote_only = remote_set - local_set
                         print(f"    [DEBUG] Part '{part_name}' has entry changes:")
                         if local_only:
                             print(f"      + {len(local_only)} entries to add")
                         if remote_only:
                             print(f"      - {len(remote_only)} entries to remove")
-                    if not action_match:
-                        print(
-                            f"      Action differs: local='{filter_config.action}', remote='{remote_action}'"
-                        )
-                    if not label_match:
-                        print(
-                            f"      Label differs: local='{filter_config.label}', remote='{remote_label}'"
-                        )
-            elif verbose:
-                print(f"    [DEBUG] Part '{part_name}' not found remotely (new)")
+                        remote_action = self._extract_remote_action(rf)
+                        remote_label = self._extract_remote_label(rf)
+                        if filter_config.action != remote_action:
+                            print(
+                                f"      Action differs: local='{filter_config.action}',"
+                                f" remote='{remote_action}'"
+                            )
+                        if filter_config.label != remote_label:
+                            print(
+                                f"      Label differs: local='{filter_config.label}',"
+                                f" remote='{remote_label}'"
+                            )
 
         return unchanged_parts
 
@@ -563,89 +1042,115 @@ class FilterManager:
             results["skipped"] = len(unchanged_names)
             return results
 
-        # Delete existing filters that match changed filters (but only changed parts for split filters)
+        # --- Per-part upsert (create-before-delete) ---
+        #
+        # For every changed filter we reconcile remote parts to local parts by
+        # exact (action, label, entry-set). New parts are created BEFORE stale
+        # parts are deleted, so a crash mid-push never leaves a filter missing:
+        # the old parts keep working until the new ones exist. Matching is
+        # order-agnostic (a local part matches any remote part with the same
+        # set), so Gmail reordering parts no longer causes churn, and parts are
+        # attributed to the right filter by content — fixing the
+        # ``delete``/``spam`` collision that both map to (delete, None).
+        created_count = 0
         deleted_count = 0
         deleted_filter_ids: set[str] = set()
 
-        for rf in remote_filters:
-            base_name = self._extract_base_name(rf)
-            if base_name in changed_names:
-                change = changes_by_name[base_name]
-                filter_config = self.config.filters[base_name]
+        # Iterate changed filters in config order for deterministic output.
+        changed_order = [n for n in self.config.filters if n in changed_names]
 
-                # For non-split filters, delete all
-                if len(filter_config.entries) <= self.config.max_entries_per_filter:
-                    if rf["id"] not in deleted_filter_ids:
-                        self.client.delete_filter(rf["id"])
-                        deleted_filter_ids.add(rf["id"])
-                        results["updated"] += 1
-                        deleted_count += 1
-                else:
-                    # For split filters, check if this specific part is unchanged
-                    rf_entries = set(self.client.parse_filter_entries(rf))
-                    parts = self._split_entries(
-                        filter_config.entries, self.config.max_entries_per_filter
-                    )
-
-                    # Find which part this is
-                    part_index = None
-                    for i, local_part in enumerate(parts, 1):
-                        if set(local_part) & rf_entries:
-                            part_index = i
-                            break
-
-                    # Delete only if this part changed
-                    if (
-                        part_index not in change.unchanged_parts
-                        and rf["id"] not in deleted_filter_ids
-                    ):
-                        self.client.delete_filter(rf["id"])
-                        deleted_filter_ids.add(rf["id"])
-                        results["updated"] += 1
-                        deleted_count += 1
-
-        if deleted_count > 0:
-            print(f"  ✓ Deleted {deleted_count} existing filter(s)")
-
-        # Create/replace changed filters
-        for name in changed_names:
+        for name in changed_order:
             filter_config = self.config.filters[name]
             entries = filter_config.entries
             change = changes_by_name[name]
 
-            if len(entries) <= self.config.max_entries_per_filter:
-                # Create single filter
-                self._create_filter_with_entries(name, filter_config, entries)
-                results["created"] += 1
-                print(f"  ✓ Created filter: {name} ({len(entries)} entries)")
-            else:
-                # Split into multiple filters
-                parts = self._split_entries(entries, self.config.max_entries_per_filter)
-                total_parts = len(parts)
+            local_parts = self._split_entries(entries, self.config.max_entries_per_filter)
+            local_sets = [frozenset(p) for p in local_parts]
+
+            # Remote parts attributed to this filter (content-aware).
+            remote_parts: list[tuple[dict, frozenset[str]]] = []
+            for rf in remote_filters:
+                if self._attribute_remote_part(rf) == name:
+                    remote_parts.append(
+                        (rf, frozenset(self.client.parse_filter_entries(rf)))
+                    )
+
+            # Match local parts to remote parts by exact (action, label, set).
+            consumed = [False] * len(remote_parts)
+            parts_to_create: list[tuple[int, list[str]]] = []  # (1-based index, entries)
+            for i, local_set in enumerate(local_sets, 1):
+                matched = False
+                for j, (rf, remote_set) in enumerate(remote_parts):
+                    if consumed[j]:
+                        continue
+                    remote_action = self._extract_remote_action(rf)
+                    remote_label = self._extract_remote_label(rf)
+                    if (
+                        filter_config.action == remote_action
+                        and filter_config.label == remote_label
+                        and local_set == remote_set
+                    ):
+                        consumed[j] = True
+                        matched = True
+                        break
+                if not matched:
+                    parts_to_create.append((i, local_parts[i - 1]))
+
+            # Orphan remote parts not matched by any local part.
+            orphans = [
+                remote_parts[j][0] for j in range(len(remote_parts)) if not consumed[j]
+            ]
+
+            total_parts = len(local_parts)
+            is_split = total_parts > 1
+
+            # Phase 1: create new/changed parts FIRST (crash-safe).
+            created_parts = 0
+            for i, part_entries in parts_to_create:
+                part_name = name if i == 1 else f"{name}-{i}"
+                self._create_filter_with_entries(part_name, filter_config, part_entries)
+                created_count += 1
+                created_parts += 1
+                print(f"  ✓ Created filter: {part_name} ({len(part_entries)} entries)")
+
+            # Phase 2: delete orphan remote parts LAST.
+            deleted_this_filter = 0
+            for rf in orphans:
+                if rf["id"] in deleted_filter_ids:
+                    continue
+                self.client.delete_filter(rf["id"])
+                deleted_filter_ids.add(rf["id"])
+                deleted_count += 1
+                deleted_this_filter += 1
+
+            if deleted_this_filter > 0:
+                print(f"  ✓ Deleted {deleted_this_filter} stale part(s) of {name}")
+
+            if is_split:
                 unchanged = change.unchanged_parts
-                created_parts = 0
-
-                for i, part_entries in enumerate(parts, 1):
-                    if i in unchanged:
-                        continue  # Skip unchanged parts
-
-                    part_name = name if i == 1 else f"{name}-{i}"
-                    self._create_filter_with_entries(part_name, filter_config, part_entries)
-                    results["created"] += 1
-                    created_parts += 1
-                    print(f"  ✓ Created filter: {part_name} ({len(part_entries)} entries)")
-
-                if unchanged:
-                    print(f"  ✓ Updated {name}: {created_parts}/{total_parts} parts changed")
-                else:
+                if unchanged and created_parts < total_parts:
+                    print(
+                        f"  ✓ Updated {name}: {created_parts}/{total_parts} parts changed"
+                    )
+                elif created_parts == total_parts and deleted_this_filter == 0:
                     print(f"  ✓ Split '{name}' into {total_parts} part(s)")
-
+                elif created_parts:
+                    print(
+                        f"  ✓ Updated {name}: {created_parts}/{total_parts} parts created"
+                    )
                 results["split_filters"].append(name)
+            elif created_parts and deleted_this_filter:
+                # Single-part filter replaced.
+                pass
 
-            # Apply labels to existing conversations ONLY for NEW entries (local_only)
-            # (Action/label changes don't affect existing messages)
-            if apply_to_existing and name in entry_changes_names and filter_config.label:
-                # Only apply label to the NEW entries being added, not all entries
+            # Apply labels to existing conversations ONLY for NEW entries
+            # (local_only). Action/label-only changes don't affect existing
+            # messages.
+            if (
+                apply_to_existing
+                and name in entry_changes_names
+                and filter_config.label
+            ):
                 new_entries = list(change.local_only)
                 if new_entries:
                     effective_rollup = (
@@ -661,7 +1166,7 @@ class FilterManager:
                         label_ids = [self.client._get_or_create_label(filter_config.label)]
                         label_desc = filter_config.label
                     print(
-                        f"  → Applying label '{label_desc}' to {len(new_entries)} new conversation(s)..."
+                        f"  → Applying label filter_config.label'{filter_config.label}' label_desc'{label_desc}' to {len(new_entries)} new conversation(s)..."
                     )
                     archive = filter_config.action in ["label_and_archive", "archive"]
                     modified_count = self.client.apply_label_to_existing(
@@ -670,6 +1175,9 @@ class FilterManager:
                     results["applied_to_existing"] += modified_count
                     if modified_count > 0:
                         print(f"    ✓ Applied to {modified_count} conversation(s)")
+
+        results["created"] = created_count
+        results["updated"] = deleted_count
 
         # Report unchanged filters
         for name in unchanged_names:
@@ -730,49 +1238,52 @@ class FilterManager:
             rollup=effective_rollup,
         )
 
-    def _extract_base_name(self, filter_obj: dict) -> str:
-        """Extract base filter name from remote filter.
+    def _attribute_remote_part(self, filter_obj: dict) -> str:
+        """Return the local filter name a remote filter part belongs to.
 
-        Matches remote filters to local filters using action + label,
-        which is more reliable than entry matching when filters are scrambled.
+        Matching is *content-aware*. Among local filters sharing the remote
+        part's ``(action, label)``, the one whose entry set is a superset of the
+        remote part's entries wins. This disambiguates filters that collide on
+        ``(action, label)`` alone — for example ``delete`` and ``spam`` both
+        map to ``(delete, None)`` — by their actual entries, so each remote
+        part is attributed to the filter it really belongs to instead of the
+        first one that happens to share an action+label.
+
+        When no ``(action, label)`` candidate contains the remote entries, a
+        single candidate is still attributed (so drifted/stale parts are
+        recognised as orphans and pruned), and otherwise matching falls back to
+        entry overlap across all filters.
         """
-        # First try to match by action + label (more reliable)
         remote_action = self._extract_remote_action(filter_obj)
         remote_label = self._extract_remote_label(filter_obj)
+        remote_entries = set(self.client.parse_filter_entries(filter_obj))
 
-        for name, local_filter in self.config.filters.items():
-            if local_filter.action == remote_action and local_filter.label == remote_label:
+        candidates = [
+            name
+            for name, f in self.config.filters.items()
+            if f.action == remote_action and f.label == remote_label
+        ]
+        # Prefer the candidate that contains every remote entry (exact content).
+        for name in candidates:
+            if remote_entries <= set(self.config.filters[name].entries):
                 return name
-
-        # Fallback to entry matching if action+label doesn't match
-        entries = self.client.parse_filter_entries(filter_obj)
-        for name, local_filter in self.config.filters.items():
-            if any(entry in local_filter.entries for entry in entries):
+        # Single (action, label) candidate: attribute even when the remote part
+        # has drifted, so the part is recognised as an orphan and pruned.
+        if len(candidates) == 1:
+            return candidates[0]
+        # Fall back to entry overlap across all filters.
+        for name, f in self.config.filters.items():
+            if remote_entries & set(f.entries):
                 return name
         return ""
+
+    def _extract_base_name(self, filter_obj: dict) -> str:
+        """Extract base filter name from a remote filter (content-aware)."""
+        return self._attribute_remote_part(filter_obj)
 
     def _match_filter_to_local(self, filter_obj: dict) -> str:
-        """Match a remote filter to a local filter name.
-
-        Uses action + label matching first, then falls back to entry overlap.
-        """
-        # First try to match by action + label
-        remote_action = self._extract_remote_action(filter_obj)
-        remote_label = self._extract_remote_label(filter_obj)
-
-        for name, local_filter in self.config.filters.items():
-            if local_filter.action == remote_action and local_filter.label == remote_label:
-                return name
-
-        # Fallback to entry matching
-        entries = self.client.parse_filter_entries(filter_obj)
-        for name, local_filter in self.config.filters.items():
-            local_entries = set(local_filter.entries)
-            remote_entries = set(entries)
-            if local_entries & remote_entries:
-                return name
-
-        return ""
+        """Match a remote filter to a local filter name (content-aware)."""
+        return self._attribute_remote_part(filter_obj)
 
     def format_filters(self, dry_run: bool = False) -> dict[str, Any]:
         """Consolidate filters with the same action and label.

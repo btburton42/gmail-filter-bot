@@ -1,5 +1,7 @@
 """Configuration management for Gmail Filter Bot."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,7 +10,14 @@ import yaml
 
 @dataclass
 class FilterConfig:
-    """Configuration for a single filter."""
+    """Configuration for a single filter.
+
+    Attributes:
+        rollup: When True, this filter is a "rollup" filter that intentionally
+            stacks its action on top of other filters. The doctor command
+            treats entries shared between a rollup filter and other filters as
+            intentional and does *not* flag them as conflicting-action duplicates.
+    """
 
     name: str
     action: str
@@ -37,7 +46,7 @@ class Credentials:
     redirect_uri: str = "http://localhost:8080"
 
     @classmethod
-    def from_env_file(cls, path: Path) -> "Credentials":
+    def from_env_file(cls, path: Path) -> Credentials:
         """Load credentials from .env file."""
         if not path.exists():
             raise FileNotFoundError(f"Credentials file not found: {path}")
@@ -57,7 +66,7 @@ class Credentials:
         )
 
     @classmethod
-    def from_json_file(cls, path: Path) -> "Credentials":
+    def from_json_file(cls, path: Path) -> Credentials:
         """Load credentials from JSON file."""
         import json
 
@@ -84,7 +93,14 @@ class Credentials:
 
 @dataclass
 class Config:
-    """Main configuration."""
+    """Main configuration.
+
+    Attributes:
+        rollup: When True (set at the YAML root), *every* filter is treated as a
+            rollup filter. Cross-filter overlaps are then considered intentional
+            and the doctor does not flag them as conflicting-action duplicates.
+            This is the global form of ``FilterConfig.rollup``.
+    """
 
     max_entries_per_filter: int
     filters: dict[str, FilterConfig]
@@ -103,7 +119,7 @@ class Config:
             ]
 
     @classmethod
-    def load(cls, config_path: Path, credentials_path: Path) -> "Config":
+    def load(cls, config_path: Path, credentials_path: Path) -> Config:
         """Load configuration from files."""
         # Load filter config
         if not config_path.exists():
@@ -130,7 +146,7 @@ class Config:
                 action=filter_data.get("action", "label_only"),
                 label=filter_data.get("label"),
                 entries=filter_data.get("entries", []),
-                rollup=filter_data.get("rollup"),
+                rollup=bool(filter_data.get("rollup", False)),
             )
 
         # Parse allowed list
@@ -141,7 +157,7 @@ class Config:
             filters=filters,
             credentials=credentials,
             allowed=allowed,
-            rollup=data.get("rollup", False),
+            rollup=bool(data.get("rollup", False)),
         )
 
     def save(self, path: Path):
@@ -167,6 +183,8 @@ class Config:
                 filter_data["label"] = filter_config.label
             if filter_config.rollup is not None:
                 filter_data["rollup"] = filter_config.rollup
+            # if filter_config.rollup:
+            #     filter_data["rollup"] = True
             data["filters"][name] = filter_data
 
         with open(path, "w") as f:

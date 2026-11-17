@@ -2,11 +2,16 @@
 
 A Python CLI tool to sync and manage Gmail filters from a local YAML configuration. Automatically handles Gmail's filter entry limits by splitting large filters across multiple rules.
 
+It exists to help manage the bullshit task that is keeping up with our emails.
+Robots can't do it for us alone. So maybe let's make the process less robotic
+... or is it more.
+
 ## Features
 
 - **Simple 3-command workflow**: `init`, `apply`, `clean`
 - **Smart sync**: Auto-detects which direction changes need to go (Gmail → local, local → Gmail, or both)
-- **Interactive labeling**: Triage senders one by one with `gfb label` — filter, allow, spam, skip, or archive
+- **Interactive triage**: Triage senders one by one with `gfb label` — filter, allow, spam, unsubscribe, skip, expand, or archive — in a two-pane UI (see [The triage screen](#7-the-triage-screen)) with a live panel of what you've decided so far
+- **Deferred, reversible side effects**: spam reports and unsubscribe requests are queued as you go and fired once, at the end, after you review them
 - **Rollup labels**: Apply nested label hierarchies (e.g. `a/b/c` → `a` + `a/b` + `a/b/c`)
 - **Part-level optimization**: Only updates changed parts of split filters (saves time on large filters)
 - **Auto-split**: Automatically creates "filter-name", "filter-name-2", etc. when entry count exceeds limits
@@ -37,21 +42,27 @@ cd gmail-filter-bot
 # Install uv if you haven't already
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install the package
+# Install the package, its dependencies, and the dev group
 uv sync
 
-# Or install with development dependencies
-uv sync --extra dev
+# Run it
+uv run gfb --help
 
-# Install the package with CLI entry points (required after uv sync)
-uv pip install -e .
-
-# Or activate the venv and run directly
+# Or activate the venv and use the entry points directly
 source .venv/bin/activate
-gmail-filter-bot --help
+gfb --help
 ```
 
-**Note:** `uv sync` installs dependencies but doesn't register the CLI entry points. You must run `uv pip install -e .` after `uv sync` to use the `gmail-filter-bot` command.
+`uv sync` builds and installs the project itself, so `gfb` and
+`gmail-filter-bot` are on the venv's `bin` from the start — no separate
+`uv pip install -e .` step. Development dependencies live in the PEP 735
+`[dependency-groups] dev` table, which `uv sync` installs by default; if you
+only want the runtime ones, `uv sync --no-dev`.
+
+If `gfb --help` reports `No module named 'textual'`, you are running an older
+**global** install that is shadowing the project venv. Either use `uv run gfb`,
+or activate `.venv` first, or refresh the global one with
+`uv pip install -e . --python "$(which python)"`.
 
 
 ## Configuration
@@ -136,40 +147,149 @@ Available actions:
 - `mark_not_important`: Mark as not important
 - `star`: Star messages
 
-### Rollup
+### 4. Rollup filters (stacked filters)
 
-Rollup applies all ancestor labels in addition to the filter's label. For example, a filter with label `a/b/c` and rollup enabled will apply three labels: `a`, `a/b`, and `a/b/c`.
-
-Enable globally (applies to all filters):
-
-```yaml
-rollup: true
-
-filters:
-  automated/general:
-    action: label_only
-    label: automated/general
-    entries: [...]
-```
-
-Or per-filter (overrides global setting):
+A filter can be marked `rollup: true` to indicate it intentionally *stacks* its
+action on top of other filters (e.g. a broad catch-all that archives everything
+from a domain, alongside a per-newsletter labeling filter):
 
 ```yaml
 filters:
-  automated/general:
-    action: label_only
-    label: automated/general
-    rollup: true
-    entries: [...]
-
-  work:
+  newsletters:
     action: label_and_archive
-    label: work
-    rollup: false        # Explicitly disable, overrides global
-    entries: [...]
+    label: Newsletters
+    entries:
+      - someone@blog.substack.com
+  substack-rollup:
+    action: archive
+    rollup: true
+    entries:
+      - '*substack.com'
 ```
 
-> **WARNING:** Rollup increases the number of labels applied to each message. In IMAP clients (Apple Mail, Thunderbird, etc.), each label appears as a separate folder. Messages with nested labels will show up in multiple folders, which uses more space and may make navigation more cluttered. Use rollup selectively if you rely on IMAP access.
+Normally an entry appearing in multiple filters with **conflicting** actions
+is a hard `doctor` failure (silent precedence conflict). When one of those
+filters is a rollup filter, the overlap is treated as a consequence of rollup
+and is *not* flagged. The same applies to same-action duplicates.
+
+### 5. Hand mode (one-handed `label` triage)
+
+The `label` command's triage keys can be kept under one hand:
+
+```bash
+gfb config set hand-mode left   # f filter / a allow / s spam / u unsubscribe / k skip / e expand / q quit / z undo (default)
+gfb config set hand-mode right  # j filter / a allow / l spam / i unsubscribe / k skip / e expand / p quit / u undo
+```
+
+Only the key hints change — the action names stay the same. Inside the app the
+filter picker is a fuzzy typeahead modal (type, arrows, enter; an unknown name
+creates a filter).
+
+`audit` uses the same keys with a different vocabulary: `allow` becomes
+`remove`, `filter` becomes `move`, `skip` becomes `keep`. The former `c` and
+`;` skip/keep bindings remain accepted for compatibility.
+
+Reading the message is driven by the arrow keys (no action is taken, nothing is
+recorded):
+
+- `↑` / `↓` show less / more of the message body, a screenful at a time. The
+  body is fetched once per message and cached.
+- `←` / `→` pick which of the sender's messages you are looking at (the list
+  marks it with `▸`). Actions then apply to *that* message — its
+  `List-Unsubscribe` header, its archive — and `f`'s "archive this message now"
+  archives exactly the message on screen.
+
+`e` (expand) shows the body of the selected message and makes no changes.
+Moving with `←` / `→` while expanded keeps the body open and loads the newly
+selected message; moving back reuses that message's cached body.
+
+### 6. Unpushed changes are surfaced before triage
+
+Triage skips senders that already appear in your local `filters.yaml`. If you
+declined `apply` at the end of an earlier session, those senders are in the
+config but *not* in Gmail — so `label`/`audit` would stop offering them while
+Gmail keeps delivering them unfiltered. Both commands therefore check for
+unpushed changes up front:
+
+```
+! 2 filter(s) have changes not yet in Gmail:
+    newsletters: +2 sender(s)
+    shopping: +1 sender(s)
+
+Apply these to Gmail before continuing? [y/N]
+```
+
+Answering `n` (or running non-interactively, e.g. in CI where stdin isn't a
+TTY) just prints the reminder to run `gfb apply` and continues.
+
+### 7. The triage screen
+
+`gfb label` and `gfb audit` open a full-screen app (alternate screen; your
+scrollback is untouched). Above 96 columns the layout is two panes and a status
+line, roughly:
+
+```
++---------------------------+------------+
+| [3/12] Name <email>       | SESSION    |
+|                           | FILTERS 2  |
+|  messages / message body  |   work +1  |
+|                           |     a@x.co |
+|                           | 2 spam     |
++---------------------------+ 1 unsub    |
+| f filter / a allow / ...  |            |
++---------------------------+------------+
+| NORMAL  left  3/12  filtered 4  queued 3 |
++------------------------------------------+
+```
+
+Below 96 columns the right-hand panel is dropped and you get the plain
+single-column version; nothing else changes.
+
+The panel is live and it is *interactive*. `tab` switches panes (clicking a row
+does the same thing), and in the panel:
+
+| Key | Does |
+|-----|------|
+| `j`/`k` or arrows | move the cursor |
+| `enter` / `e` | expand or collapse a filter branch |
+| `x` | drop the row from this session |
+| `m` | move the row to another filter |
+| `s` | queue the row for spam |
+| `a` | allow the row (leave its delivery alone) |
+| `u` | unqueue a row that is waiting to be fired |
+
+Rows are undoable with `z`, same as decisions made in the left pane. Until you
+exit, *nothing has been sent*: the local config changes immediately (they are
+visible and revertible), but the spam reports and unsubscribe requests are only
+queued. When the walk ends — or when you press `q` — the app stops at a review
+screen listing the queue, where `x` skips an item and `enter` approves the rest.
+Skipping and cancelling both mean nothing is sent.
+
+Once the app exits, the summary, the save, and the actual network calls all
+happen in your normal terminal, in that order, printed as plain text:
+
+```
+==================================================
+Triage Summary:
+  Filtered:     4
+  Allowed:      1
+  Spammed:      2
+  Unsubscribed: 1
+  Skipped:      5
+  Queued:       2 spam, 1 unsubscribe (not sent yet)
+
+Sending 2 spam report(s) and 1 unsubscribe(s)...
+  ✓ spam: 7 sender(s) reported
+  ✓ list@example.com: unsubscribed via POST
+```
+
+That ordering is the point of deferring: you see exactly what was sent, and a
+`Ctrl-C` before the review screen means nothing went out at all.
+
+`gfb config set theme <name>` picks the colour scheme (any built-in Textual
+theme: `textual-dark`, `gruvbox`, `nord`, `catppuccin-mocha`, `dracula`, …).
+The zero state the panel shows is `0 queued. suspicious.` — a small joke that
+also happens to be the truth.
 
 ## Usage
 
@@ -181,7 +301,10 @@ filters:
 | `plan` | Preview what changes would be applied. Shows exactly what would happen during apply without making any changes. | `--push`: Show push plan only<br>`--pull`: Show pull plan only |
 | `apply` | **Main command** - syncs changes between local config and Gmail. Auto-detects direction and applies changes immediately. | `--push`: Force push local → Gmail only<br>`--pull`: Force pull Gmail → local only<br>`--no-apply-existing`: Skip labeling existing conversations |
 | `clean` | Optimize your configuration by removing duplicates and consolidating similar filters. | `--dry-run`: Preview changes |
-| `label` | Interactively triage email senders — filter, allow, spam, skip, or archive each one. | `[folder]`: Gmail label to scan (default: Inbox)<br>`--max-messages N`: Limit messages (default: 200)<br>`--rollup`: Fetch from all sub-labels |
+| `doctor` | Diagnose configuration, credentials, and (optionally) your Gmail connection. Each diagnosis is prefixed with its type. Exits non-zero on hard failures. | `--no-remote`: Skip Gmail checks<br>`--quiet`: Hide passing checks |
+| `doctor resolve [type]` | Auto-fix a diagnosis type in `filters.yaml` (e.g. `wildcard_shadowing`, `within_filter_duplicates`, `cross_filter_duplicates`). Run with no type to list what's fixable. | — |
+| `config` | Get, set, or list user settings (`hand-mode`, `filters-path`, `theme`). | `get`/`set`/`ls` |
+| `forget` | Forget the remembered `filters.yaml` location. | — |
 
 ### Quick Start
 
@@ -203,6 +326,8 @@ gmail-filter-bot clean
 gmail-filter-bot label
 gmail-filter-bot label newsletters          # Triage a specific label
 gmail-filter-bot label automated --rollup   # Triage with sub-labels rolled up
+# 5. Diagnose problems (malformed entries, duplicates, drift)
+gmail-filter-bot doctor
 ```
 
 ### Detailed Examples
@@ -250,6 +375,25 @@ gmail-filter-bot clean
 # Preview first
 gmail-filter-bot clean --dry-run
 ```
+
+**Diagnose problems:**
+```bash
+# Run all health checks (local + Gmail)
+gmail-filter-bot doctor
+
+# Skip Gmail checks (offline / CI)
+gmail-filter-bot doctor --no-remote
+
+# Only show warnings and failures
+gmail-filter-bot doctor --quiet
+```
+
+`doctor` checks credentials, the config file, malformed entries
+(e.g. stray whitespace inside an address), duplicate entries (within and
+across filters), wildcard shadowing, near-split filters, and — unless
+`--no-remote` is set — your Gmail connection, missing referenced labels,
+and orphaned remote filters. It exits non-zero on hard failures, so it's
+safe to run in CI or before `apply`.
 
 ### Development Commands
 

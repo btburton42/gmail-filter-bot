@@ -1,12 +1,26 @@
 """Command-line interface for Gmail Filter Bot."""
 
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 
+from . import settings
 from .config import Config, Credentials
 from .filter_manager import FilterManager
 from .gmail_client import GmailClient
+from .paths import (
+    CREDENTIALS_FILENAME,
+    TOKEN_FILENAME,
+    forget_filters_path,
+    remember_filters_path,
+    resolve_filters_path,
+    sibling_dir,
+)
+from .tui.app import run_triage
+from .tui.controller import TriageController
+from .tui.sessions import Item, TriageSession
+from .tui.state import TriageState
 
 
 def main():
@@ -21,20 +35,25 @@ Examples:
   gmail-filter-bot apply             # Sync changes (auto-detects direction)
   gmail-filter-bot label             # Interactively triage Inbox senders
   gmail-filter-bot label newsletters # Triage senders in the newsletters label
+  gmail-filter-bot audit             # Review & recategorize existing entries
+  gmail-filter-bot audit newsletters/*  # Audit every newsletters sublabel
+  gmail-filter-bot doctor            # Diagnose configuration and setup problems
+  gmail-filter-bot doctor resolve    # List auto-fixable diagnoses
+  gmail-filter-bot config set hand-mode right  # One-handed right-hand keys
   gmail-filter-bot clean             # Remove duplicates and optimize config
         """,
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("filters.yaml"),
-        help="Path to filters configuration file (default: filters.yaml)",
+        default=None,
+        help="Path to filters configuration file (default: auto-resolved filters.yaml)",
     )
     parser.add_argument(
         "--credentials",
         type=Path,
-        default=Path(".env"),
-        help="Path to credentials file (default: .env)",
+        default=None,
+        help="Path to credentials file (default: .env next to filters.yaml)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -108,6 +127,49 @@ Use 'plan' first to preview what would change.""",
         help="Skip applying labels to existing conversations",
     )
 
+    # doctor command - diagnose problems
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Diagnose configuration and setup problems",
+        description="""Run health checks on your configuration, credentials, and (optionally) your Gmail connection.
+
+Reports per-check status (pass / warn / fail) and exits non-zero when any
+hard failure is found. Use --no-remote to skip checks that contact Gmail.
+
+Each diagnosis is prefixed with its type, e.g.
+  ✔ wildcard_shadowing: No wildcard shadowing within filters
+Use `doctor resolve <type>` to auto-fix supported types.""",
+    )
+    doctor_parser.add_argument(
+        "--no-remote",
+        action="store_true",
+        help="Skip checks that contact Gmail (credentials/config/token only)",
+    )
+    doctor_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Only show warnings and failures (hide passing checks)",
+    )
+    doctor_subparsers = doctor_parser.add_subparsers(
+        dest="doctor_command",
+        help="Doctor subcommands",
+    )
+    resolve_parser = doctor_subparsers.add_parser(
+        "resolve",
+        help="Auto-fix a specific diagnosis type",
+        description=(
+            "Auto-fix a specific diagnosis type in filters.yaml.\n\n"
+            "Supported types: " + ", ".join(settings.RESOLVABLE_CHECKS) + "\n\n"
+            "Run with no type to list the currently resolvable diagnoses."
+        ),
+    )
+    resolve_parser.add_argument(
+        "type",
+        nargs="?",
+        default=None,
+        help="Diagnosis type to resolve (e.g. wildcard_shadowing)",
+    )
+
     # clean command
     clean_parser = subparsers.add_parser(
         "clean",
@@ -118,6 +180,48 @@ Use 'plan' first to preview what would change.""",
         "--dry-run",
         action="store_true",
         help="Show what would change without modifying filters.yaml",
+    )
+
+    # config command - get/set user-level settings
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Get, set, or list user configuration",
+        description=(
+            "Read and write user-level settings stored in "
+            f"{settings.user_config_path()}.\n\n"
+            "Settings:\n"
+            "  hand-mode     'left' or 'right' key map for the label command\n"
+            "  filters-path  remembered location of filters.yaml\n\n"
+            "Examples:\n"
+            "  gfb config set hand-mode right\n"
+            "  gfb config get hand-mode\n"
+            "  gfb config ls\n"
+            "  gfb config set filters-path ~/Repos/gmail-filter-bot/filters.yaml"
+        ),
+    )
+    config_subparsers = config_parser.add_subparsers(
+        dest="config_command",
+        help="config accessor",
+    )
+    config_get_parser = config_subparsers.add_parser(
+        "get",
+        help="Print the value of a setting",
+    )
+    config_get_parser.add_argument(
+        "key",
+        nargs="?",
+        default=None,
+        help="Setting key (omit to list all)",
+    )
+    config_set_parser = config_subparsers.add_parser(
+        "set",
+        help="Set a setting value",
+    )
+    config_set_parser.add_argument("key", help="Setting key")
+    config_set_parser.add_argument("value", help="Setting value")
+    config_subparsers.add_parser(
+        "ls",
+        help="List all settings with their current values",
     )
 
     # help command
@@ -133,18 +237,40 @@ Use 'plan' first to preview what would change.""",
         help="Topic to get help on (commands, auth, config, troubleshooting)",
     )
 
+    # forget command - clear remembered filters.yaml location
+    subparsers.add_parser(
+        "forget",
+        help="Forget the remembered filters.yaml location",
+        description=(
+            "Clear the remembered filters.yaml path stored in the user config "
+            "(~/.config/gmail-filter-bot/config.yaml). Useful if you've moved "
+            "or deleted a project."
+        ),
+    )
+
     # label command - interactive sender triage
     label_parser = subparsers.add_parser(
         "label",
         help="Interactively triage and label email senders",
         description="""Fetch unique senders from a Gmail folder and interactively
 assign them to filters. Present each sender one by one:
-  (f)ilter - assign to a filter (with autocomplete)
+  (f)ilter - assign to a filter (typeahead, ranked by last used)
   (a)llow  - skip this sender (remembered, won't appear again)
   (s)pam   - add to spam (delete) filter and report as spam
-  (k)      - skip this sender for now (will appear again next time)
-  (v)      - archive the current message
+  (u)nsubscribe - use the sender's List-Unsubscribe header to opt out
+  (e)xpand - print the opening lines of the message body (re-prompts)
+  (k)skip   - skip this sender for now (will appear again next time)
   (q)uit   - exit and proceed to summary
+
+The exact keys follow your hand-mode (left or right); set it with:
+  gfb config set hand-mode left   # f / a / s / u / e / k / q / z
+  gfb config set hand-mode right  # j / a / l / i / e / k / p / u
+
+Unsubscribe and spam are deferred, undoable decisions. At the end of the
+walk (including quitting early), a review screen shows everything queued;
+nothing is sent until you approve that review and the app has exited.
+Senders with no List-Unsubscribe header are reported as unsupported — filter
+or spam them instead.
 
 After the session, changes are saved to filters.yaml and you'll be
 prompted to apply them to Gmail.""",
@@ -169,27 +295,96 @@ prompted to apply them to Gmail.""",
         help="Roll up all sub-labels into one view (e.g. 'a' matches 'a', 'a/b', 'a/b/c')",
     )
 
+    # audit command - review & recategorize existing filter entries
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Review and recategorize existing filter entries",
+        description="""Review each entry already bucketed into a filter and recategorize it.
+
+Present each entry one at a time:
+  (f) move   - recategorize to another filter (typeahead, ranked by last used)
+  (a) remove - delete the entry from filters.yaml entirely
+  (s) spam   - move the entry to the spam (delete) filter
+  (k) keep   - leave the entry in its current filter
+  (q) quit   - exit and proceed to summary
+  (z) undo   - rewind the last action (finger-slip recovery)
+
+The exact keys follow your hand-mode (left or right); set it with:
+  gfb config set hand-mode left   # f / a / s / k / q / z
+  gfb config set hand-mode right  # j / a / l / k / p / u
+
+There is no "allow" action: the entries being audited are already bucketed
+into a label, so you either keep, move, spam, or remove them.
+
+Arguments (optional, selects which filters to review):
+  gfb audit                  review every filter, starting from the first
+  gfb audit newsletters      review just the newsletters filter
+  gfb audit 'newsletters/*'  review every newsletters sublabel (glob)
+
+After the session, changes are saved to filters.yaml and you'll be prompted
+to apply them to Gmail.""",
+    )
+    audit_parser.add_argument(
+        "label",
+        nargs="?",
+        default=None,
+        help=(
+            "Filter name or glob to review (default: all filters). "
+            "A glob like 'newsletters/*' reviews every matching sublabel."
+        ),
+    )
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         return 1
 
+    # Resolve filters.yaml (auto: CWD -> walk up -> remembered -> default).
+    config_path = resolve_filters_path(args.config)
+    filters_dir = sibling_dir(config_path)
+    credentials_path = args.credentials if args.credentials is not None else (
+        filters_dir / CREDENTIALS_FILENAME
+    )
+    token_path = filters_dir / TOKEN_FILENAME
+
+    # ``forget`` only touches the user config; it needs nothing else.
+    if args.command == "forget":
+        if forget_filters_path():
+            print("Forgot remembered filters.yaml location.")
+        else:
+            print("No remembered filters.yaml location to forget.")
+        return 0
+
+    # ``config`` only touches the user config; it needs no filters.yaml.
+    if args.command == "config":
+        return cmd_config(args)
+
     try:
         # Handle init command separately - it doesn't need existing config
         if args.command == "init":
-            credentials = Credentials.from_env_file(args.credentials)
-            client = GmailClient(credentials)
-            return cmd_init(credentials, client, args)
+            credentials = Credentials.from_env_file(credentials_path)
+            client = GmailClient(credentials, token_path=token_path)
+            return cmd_init(credentials, client, args, config_path, credentials_path)
+
+        # Handle doctor command separately - it must tolerate a missing/broken
+        # config and credentials, so it does its own resilient loading.
+        if args.command == "doctor":
+            return cmd_doctor(args, config_path, credentials_path, token_path)
 
         # Load configuration for other commands
-        config = Config.load(args.config, args.credentials)
+        config = Config.load(config_path, credentials_path)
+
+        # Remember where filters.yaml lives so future runs from other
+        # directories can still find it.
+        if config_path.is_file():
+            remember_filters_path(config_path)
 
         # Initialize Gmail client
-        client = GmailClient(config.credentials)
+        client = GmailClient(config.credentials, token_path=token_path)
 
         # Initialize filter manager
-        manager = FilterManager(config, client, args.config)
+        manager = FilterManager(config, client, config_path)
 
         if args.command == "plan":
             return cmd_plan(manager, args)
@@ -199,13 +394,15 @@ prompted to apply them to Gmail.""",
             return cmd_clean(manager, args)
         elif args.command == "label":
             return cmd_label(manager, args)
+        elif args.command == "audit":
+            return cmd_audit(manager, args)
         elif args.command == "help":
             return cmd_help(args)
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         if args.command != "init":
-            print(f"\nMake sure you've created the {args.config} file.", file=sys.stderr)
+            print(f"\nMake sure you've created the {config_path} file.", file=sys.stderr)
             print("Run: gmail-filter-bot init", file=sys.stderr)
         return 1
     except Exception as e:
@@ -215,9 +412,8 @@ prompted to apply them to Gmail.""",
     return 0
 
 
-def cmd_init(credentials, client, args):
+def cmd_init(credentials, client, args, config_path: Path, credentials_path: Path):
     """Handle init command - import existing Gmail filters."""
-    config_path = args.config
 
     # Check if filters.yaml already exists
     if config_path.exists() and not args.dry_run:
@@ -319,6 +515,9 @@ def cmd_init(credentials, client, args):
 
     # Save the config
     new_config.save(config_path)
+
+    # Remember where we just created it.
+    remember_filters_path(config_path)
 
     print(f"\nCreated {config_path} with {len(new_config.filters)} filter(s):")
     for name in new_config.filters:
@@ -642,13 +841,526 @@ def cmd_clean(manager: FilterManager, args):
     return 0
 
 
+def cmd_doctor(args, config_path: Path, credentials_path: Path, token_path: Path):
+    """Handle doctor command - diagnose configuration and setup problems."""
+    # `doctor resolve <type>` auto-fixes a diagnosis; handle it separately.
+    if getattr(args, "doctor_command", None) == "resolve":
+        return cmd_doctor_resolve(args, config_path, credentials_path, token_path)
+
+    no_remote = args.no_remote
+    quiet = args.quiet
+
+    checks: list[dict] = []
+
+    # --- Credentials ---
+    creds = None
+    if not credentials_path.exists():
+        checks.append(
+            {
+                "name": "credentials_file",
+                "level": "fail",
+                "message": f"Credentials file not found: {credentials_path}",
+                "details": [],
+            }
+        )
+    else:
+        try:
+            creds = Credentials.from_env_file(credentials_path)
+        except Exception as e:
+            checks.append(
+                {
+                    "name": "credentials_file",
+                    "level": "fail",
+                    "message": f"Could not read credentials file: {e}",
+                    "details": [],
+                }
+            )
+
+    if creds is not None:
+        issues = []
+        if not creds.client_id:
+            issues.append("GOOGLE_CLIENT_ID is empty")
+        elif not creds.client_id.endswith(".apps.googleusercontent.com"):
+            issues.append(
+                "GOOGLE_CLIENT_ID doesn't look like a desktop OAuth client id "
+                "(expected to end in .apps.googleusercontent.com)"
+            )
+        if not creds.client_secret:
+            issues.append("GOOGLE_CLIENT_SECRET is empty")
+        if issues:
+            checks.append(
+                {
+                    "name": "credentials_values",
+                    "level": "fail",
+                    "message": f"{len(issues)} credential problem(s)",
+                    "details": issues,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "credentials_values",
+                    "level": "pass",
+                    "message": "Credentials look well-formed",
+                    "details": [],
+                }
+            )
+
+    # --- Config file ---
+    config = None
+    if not config_path.exists():
+        checks.append(
+            {
+                "name": "config_file",
+                "level": "fail",
+                "message": f"Configuration file not found: {config_path}",
+                "details": ["Run: gmail-filter-bot init"],
+            }
+        )
+    else:
+        try:
+            config = Config.load(config_path, credentials_path)
+            checks.append(
+                {
+                    "name": "config_file",
+                    "level": "pass",
+                    "message": f"Loaded {config_path} ({len(config.filters)} filters)",
+                    "details": [],
+                }
+            )
+        except Exception as e:
+            checks.append(
+                {
+                    "name": "config_file",
+                    "level": "fail",
+                    "message": f"Could not load configuration: {e}",
+                    "details": [],
+                }
+            )
+        else:
+            # Remember where filters.yaml lives for future runs from other
+            # dirs. This is a best-effort side effect: a failure to persist the
+            # remembered path (e.g. an unwritable user-config dir) must not
+            # fail the config_file health check.
+            with contextlib.suppress(Exception):
+                remember_filters_path(config_path)
+
+    # --- Local (offline) checks ---
+    if config is not None:
+        try:
+            # diagnose() never touches the network, so a None client is safe.
+            manager = FilterManager(config, None, config_path)
+            checks.extend(manager.diagnose())
+        except Exception as e:
+            checks.append(
+                {
+                    "name": "local_checks",
+                    "level": "fail",
+                    "message": f"Local checks crashed: {e}",
+                    "details": [],
+                }
+            )
+
+    # --- Token ---
+    if token_path.exists():
+        checks.append(
+            {
+                "name": "token",
+                "level": "pass",
+                "message": f"{token_path} present",
+                "details": [],
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "token",
+                "level": "warn",
+                "message": (
+                    f"{token_path} not found - you'll be prompted to authenticate "
+                    "on the next command"
+                ),
+                "details": [],
+            }
+        )
+
+    # --- Remote checks ---
+    if no_remote:
+        checks.append(
+            {
+                "name": "remote",
+                "level": "pass",
+                "message": "Remote checks skipped (--no-remote)",
+                "details": [],
+            }
+        )
+    elif creds is None:
+        checks.append(
+            {
+                "name": "remote",
+                "level": "warn",
+                "message": "Remote checks skipped (no credentials)",
+                "details": [],
+            }
+        )
+    elif config is None:
+        checks.append(
+            {
+                "name": "remote",
+                "level": "warn",
+                "message": "Remote checks skipped (no valid config)",
+                "details": [],
+            }
+        )
+    elif not token_path.exists():
+        checks.append(
+            {
+                "name": "remote",
+                "level": "warn",
+                "message": "Remote checks skipped (no token - run another command to authenticate)",
+                "details": [],
+            }
+        )
+    else:
+        try:
+            client = GmailClient(creds)
+            manager = FilterManager(config, client, config_path)
+            checks.extend(_doctor_remote_checks(manager, client))
+        except Exception as e:
+            checks.append(
+                {
+                    "name": "remote",
+                    "level": "fail",
+                    "message": f"Remote checks failed: {e}",
+                    "details": [],
+                }
+            )
+
+    # --- Report ---
+    symbols = {"pass": "✓", "warn": "⚠", "fail": "✗"}
+    counts = {"pass": 0, "warn": 0, "fail": 0}
+    for c in checks:
+        counts[c["level"]] += 1
+
+    print("Running health checks...\n")
+    for c in checks:
+        if quiet and c["level"] == "pass":
+            continue
+        sym = symbols[c["level"]]
+        print(f"  {sym} {c['name']}: {c['message']}")
+        for detail in c.get("details", []):
+            print(f"      - {detail}")
+
+    print(f"\n{'=' * 50}")
+    print(
+        f"Doctor: {counts['pass']} passed, {counts['warn']} warning(s), "
+        f"{counts['fail']} failure(s)"
+    )
+
+    return 1 if counts["fail"] > 0 else 0
+
+
+def cmd_doctor_resolve(args, config_path: Path, credentials_path: Path, token_path: Path):
+    """Handle `doctor resolve [type]` - auto-fix a diagnosis type."""
+    check_name = args.type
+
+    if not config_path.exists():
+        print(f"Error: Configuration file not found: {config_path}", file=sys.stderr)
+        print("Run: gmail-filter-bot init", file=sys.stderr)
+        return 1
+
+    try:
+        config = Config.load(config_path, credentials_path)
+    except Exception as e:
+        print(f"Error: Could not load configuration: {e}", file=sys.stderr)
+        return 1
+
+    manager = FilterManager(config, None, config_path)
+
+    # No type given: list the resolvable diagnoses currently present.
+    if check_name is None:
+        try:
+            checks = manager.diagnose()
+        except Exception as e:
+            print(f"Error running diagnosis: {e}", file=sys.stderr)
+            return 1
+        print("Resolvable diagnosis types:")
+        print(f"  supported: {', '.join(settings.RESOLVABLE_CHECKS)}\n")
+        found = False
+        for c in checks:
+            if c["name"] in settings.RESOLVABLE_CHECKS and c["level"] != "pass":
+                found = True
+                print(f"  {c['name']}: {c['message']}")
+        if not found:
+            print("  (no resolvable diagnoses found)")
+        print("\nRun: gfb doctor resolve <type>")
+        return 0
+
+    try:
+        result = manager.resolve(check_name)
+    except Exception as e:
+        print(f"Error resolving '{check_name}': {e}", file=sys.stderr)
+        return 1
+
+    if result["resolved"]:
+        print(f"Resolved {result['fixed']} item(s) for '{check_name}'.")
+        for d in result["details"]:
+            print(f"  - {d}")
+        print(f"\nSaved {config_path}")
+        return 0
+    else:
+        reason = result["reason"] or "nothing to fix"
+        print(f"Could not resolve '{check_name}': {reason}")
+        return 1
+
+
+def cmd_config(args):
+    """Handle `config get/set/ls` - user-level settings."""
+    sub = getattr(args, "config_command", None)
+    key = getattr(args, "key", None)
+    value = getattr(args, "value", None)
+
+    if sub == "ls" or (sub == "get" and key is None) or sub is None:
+        return _config_ls()
+    if sub == "get":
+        return _config_get(key)
+    if sub == "set":
+        return _config_set(key, value)
+    print(f"Unknown config command: {sub}", file=sys.stderr)
+    return 1
+
+
+def _config_ls():
+    print(f"User config: {settings.user_config_path()}\n")
+    for key in settings.VISIBLE_SETTINGS:
+        val = settings.get(key)
+        shown = val if val is not None else "<not set>"
+        print(f"{key} = {shown}")
+        desc = settings.DESCRIPTIONS.get(key, "")
+        if desc:
+            print(f"    {desc}")
+        print()
+    return 0
+
+
+def _config_get(key: str):
+    if key not in settings.VISIBLE_SETTINGS:
+        print(
+            f"Unknown setting '{key}'. Known: {', '.join(settings.VISIBLE_SETTINGS)}",
+            file=sys.stderr,
+        )
+        return 1
+    val = settings.get(key)
+    print(val if val is not None else "<not set>")
+    return 0
+
+
+def _config_set(key: str, value: str):
+    if key not in settings.SETTABLE_SETTINGS:
+        print(
+            f"Unknown setting '{key}'. Settable: {', '.join(settings.SETTABLE_SETTINGS)}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        settings.set(key, value)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    new_val = settings.get(key)
+    print(f"{key} = {new_val}")
+    return 0
+
+
+def _doctor_remote_checks(manager: FilterManager, client: GmailClient):
+    """Run checks that require a live Gmail connection."""
+    checks: list[dict] = []
+
+    # Connectivity
+    try:
+        labels = client.list_labels()
+        checks.append(
+            {
+                "name": "remote_connectivity",
+                "level": "pass",
+                "message": f"Connected to Gmail ({len(labels)} label(s))",
+                "details": [],
+            }
+        )
+    except Exception as e:
+        checks.append(
+            {
+                "name": "remote_connectivity",
+                "level": "fail",
+                "message": f"Could not connect to Gmail: {e}",
+                "details": [],
+            }
+        )
+        return checks
+
+    # Referenced labels exist in Gmail
+    referenced = {
+        f.label for f in manager.config.filters.values() if f.label
+    }
+    label_names_lower = {n.lower() for n in labels}
+    missing = sorted({name for name in referenced if name.lower() not in label_names_lower})
+    if missing:
+        checks.append(
+            {
+                "name": "remote_labels",
+                "level": "warn",
+                "message": f"{len(missing)} referenced label(s) not in Gmail (created on apply)",
+                "details": missing,
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "remote_labels",
+                "level": "pass",
+                "message": "All referenced labels exist in Gmail",
+                "details": [],
+            }
+        )
+
+    # Orphaned remote filters (no matching local filter)
+    remote_filters = client.list_filters()
+    orphans: list[str] = []
+    for rf in remote_filters:
+        base = manager._match_filter_to_local(rf)
+        if not base:
+            action = manager._extract_remote_action(rf)
+            label = manager._extract_remote_label(rf)
+            nentries = len(client.parse_filter_entries(rf))
+            orphans.append(f"action={action}, label={label}, {nentries} entries")
+    if orphans:
+        checks.append(
+            {
+                "name": "remote_orphans",
+                "level": "warn",
+                "message": f"{len(orphans)} remote filter(s) not matched to any local config",
+                "details": orphans,
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "remote_orphans",
+                "level": "pass",
+                "message": "All remote filters matched to local config",
+                "details": [],
+            }
+        )
+
+    return checks
+
+
+# Arrow-key escape sequences: ESC [ X (and ESC O X for some terminals).
+_ARROW_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left"}
+
+
+# --- triage aftermath ------------------------------------------------------
+#
+# The interactive part happens in the Textual app (``gmail_filter_bot.tui``),
+# which runs in the alternate screen and returns a TriageResult. Everything
+# below runs *after* that screen is gone, so the output is plain text that can
+# be piped, grepped, or pasted into an issue.
+#
+# That separation is the whole point of deferring the irreversible work: the
+# user reviews the queue inside the app, but the reports and unsubscribe
+# requests are actually sent here, in the open, with their results printed.
+
+
+def _print_triage_summary(manager: FilterManager, session, *, audit: bool) -> None:
+    """Print the closing tally and the list of changes."""
+    state = session.state
+    print(f"\n{'=' * 50}")
+    print("Audit Summary:" if audit else "Triage Summary:")
+    for line in state.summary_lines(audit=audit):
+        print(line)
+    change_lines = TriageController(manager, state).change_lines()
+    if change_lines:
+        print()
+        for line in change_lines:
+            print(line)
+
+
+def _fire_deferred_queue(manager: FilterManager, session, keep: list[str]) -> None:
+    """Send the spam reports and unsubscribe requests the user approved.
+
+    ``keep`` is the list of emails that survived the review screen. Anything the
+    user skipped is dropped from the queue *before* firing, so a skipped sender
+    is never accidentally included by a later loop.
+    """
+    state = session.state
+    approved = set(keep)
+    spam = [item for item in state.spam_queue if item.email in approved]
+    unsubs = [item for item in state.unsub_queue if item.email in approved]
+    dropped = (len(state.spam_queue) - len(spam)) + (len(state.unsub_queue) - len(unsubs))
+    state.spam_queue[:] = spam
+    state.unsub_queue[:] = unsubs
+
+    if dropped:
+        print(f"\nDropped {dropped} queued item(s) at the review screen.")
+    if not spam and not unsubs:
+        print("\nNothing was sent.")
+        return
+
+    print(
+        f"\nSending {len(spam)} spam report(s) "
+        f"and {len(unsubs)} unsubscribe(s)..."
+    )
+    report = TriageController(manager, state).fire_queue()
+
+    if report.spam_queued:
+        if report.spam_error:
+            print(f"  ! spam: failed ({report.spam_error})")
+        else:
+            print(f"  \u2713 spam: {report.spam_reported} sender(s) reported")
+    for email, status, message in report.unsubs:
+        mark = "\u2713" if status in ("one_click", "url") else "!"
+        print(f"  {mark} {email}: {message}")
+
+
+def _finish_triage(manager: FilterManager, session, result, *, audit: bool) -> int:
+    """Summarize, save, fire the deferred queue, and offer to push to Gmail."""
+    state = session.state
+    _print_triage_summary(manager, session, audit=audit)
+
+    if not result.completed and session.items:
+        print(
+            f"\n(stopped at item {session.position} \u2014 "
+            "nothing was sent behind your back)"
+        )
+
+    if not state.changed_anything:
+        print("\nNo changes made.")
+        return 0
+
+    manager.config.save(manager.config_path)
+    print(f"\nSaved to {manager.config_path}")
+
+    if result.reviewed and result.keep is not None:
+        _fire_deferred_queue(manager, session, result.keep)
+    elif state.pending_count:
+        print(
+            f"\n{state.pending_count} queued item(s) left unsent "
+            "(the review was cancelled). Run the command again to queue them."
+        )
+
+    return _offer_apply(manager)
+
+
 def cmd_label(manager: FilterManager, args):
     """Handle label command - interactively triage and label email senders."""
-    import questionary
 
     folder = args.folder
     max_messages = args.max_messages
-    rollup = args.rollup
+    rollup = getattr(args, "rollup", False)
+
+    # Warn (and offer to push) when an earlier session left local filters
+    # unpushed — otherwise these senders are skipped without ever reaching Gmail.
+    _check_pending_changes(manager)
 
     if rollup:
         all_labels = manager.client.list_labels()
@@ -677,7 +1389,7 @@ def cmd_label(manager: FilterManager, args):
             print(f"  Fetching from '{label_name}' (up to {per_label} messages)...")
             label_senders = manager.client.list_senders(label_id, max_results=per_label)
             for entry in label_senders:
-                email = entry[1]
+                email = entry.email
                 if email not in seen_emails:
                     seen_emails.add(email)
                     senders.append(entry)
@@ -701,7 +1413,7 @@ def cmd_label(manager: FilterManager, args):
     print(f"Found {len(senders)} unique sender(s).")
 
     # Filter out senders already covered by existing filter entries or allowed list
-    new_senders = [s for s in senders if not _is_sender_filtered(s[1], manager.config)]
+    new_senders = [s for s in senders if not _is_sender_filtered(s.email, manager.config)]
     skipped = len(senders) - len(new_senders)
     if skipped:
         print(f"Skipping {skipped} sender(s) already covered by existing filters or allowed list.")
@@ -711,149 +1423,122 @@ def cmd_label(manager: FilterManager, args):
         return 0
 
     print(f"\n{len(new_senders)} sender(s) to triage.")
-    print("Commands: (f)ilter, (a)llow, (s)pam, (k) skip, (q)uit\n")
 
-    # Track changes
-    changes: dict[str, list[str]] = {}  # filter_name -> list of added emails
-    allowed_count = 0
-    spammed_count = 0
-    filtered_count = 0
-    skipped_count = 0
-    archived_count = 0
-    should_quit = False
+    # The interactive loop lives in the Textual app now. Everything above this
+    # line is fetching and filtering; everything below is the aftermath, and it
+    # runs in a *normal* terminal because the app has already exited.
+    state = TriageState(config=manager.config)
+    controller = TriageController(manager, state)
+    session = TriageSession(
+        manager,
+        state,
+        controller,
+        items=[Item.from_sender(sender) for sender in new_senders],
+    )
+    result = run_triage(session)
+    return _finish_triage(manager, session, result, audit=False)
 
-    for i, (display_name, email, subjects, msg_id) in enumerate(new_senders, 1):
-        if len(subjects) > 1:
-            subject_lines = "\n".join(f"  • {s}" for s in subjects)
-            prompt_text = (
-                f"[{i}/{len(new_senders)}] {display_name} <{email}>\n"
-                f"{subject_lines}\n"
-                f"  [f]ilter / [a]llow / [s]pam / [k] skip / [q]uit: "
+
+def _push_to_gmail(manager: FilterManager, *, apply_to_existing: bool = True) -> int:
+    """Push local filters to Gmail, reporting the result. Returns an exit code.
+
+    Shared by :func:`_offer_apply` (end of a triage session) and
+    :func:`_check_pending_changes` (start of one).
+    """
+    print("\nApplying to Gmail...")
+    try:
+        push_results = manager.push(
+            apply_to_existing=apply_to_existing, verbose=False, dry_run=False
+        )
+        print(f"\nPushed {push_results['created']} filter(s) to Gmail.")
+        if push_results.get("skipped"):
+            print(f"Skipped {push_results['skipped']} filter(s) (no changes).")
+        if push_results.get("applied_to_existing"):
+            print(
+                f"Applied labels to {push_results['applied_to_existing']} existing conversation(s)."
             )
-        else:
-            prompt_text = (
-                f"[{i}/{len(new_senders)}] {display_name} <{email}>\n"
-                f"  Subject: {subjects[0] if subjects else ''}\n"
-                f"  [f]ilter / [a]llow / [s]pam / [k] skip / [q]uit: "
-            )
+    except Exception as e:
+        print(f"Error applying: {e}", file=sys.stderr)
+        return 1
 
-        while True:
-            try:
-                choice = input(prompt_text).strip().lower()
-            except (KeyboardInterrupt, EOFError):
-                print("\n\nExiting triage early.")
-                should_quit = True
-                break
+    return 0
 
-            if choice in ("f", "filter"):
-                filter_name = _prompt_filter_selection(manager.config, questionary)
-                if filter_name is None:
-                    print("  Cancelled. Try again.")
-                    continue
-                if filter_name == "__archive__":
-                    archived_count += 1
-                    from .config import FilterConfig
 
-                    if "archive" not in manager.config.filters:
-                        manager.config.filters["archive"] = FilterConfig(
-                            name="archive",
-                            action="archive",
-                            entries=[],
-                        )
-                    if email not in manager.config.filters["archive"].entries:
-                        manager.config.filters["archive"].entries.append(email)
-                        changes.setdefault("archive", []).append(email)
-                    print("  -> Archiving message...", end=" ", flush=True)
-                    try:
-                        if manager.client.archive_message(msg_id):
-                            print("done.")
-                        else:
-                            print("failed.")
-                    except Exception as e:
-                        print(f"error: {e}")
-                    break
-                if filter_name not in manager.config.filters:
-                    from .config import FilterConfig
+def _pending_local_changes(manager: FilterManager) -> list:
+    """Return filters whose local config differs from Gmail (empty on failure)."""
+    try:
+        changes = manager.detect_changes()
+    except Exception:
+        return []
+    return [
+        change
+        for change in changes
+        if change.local_only
+        or change.action_changed
+        or change.label_changed
+        or change.rollup_changed
+    ]
 
-                    manager.config.filters[filter_name] = FilterConfig(
-                        name=filter_name,
-                        action="label_and_archive",
-                        label=filter_name,
-                        entries=[],
-                    )
-                if email not in manager.config.filters[filter_name].entries:
-                    manager.config.filters[filter_name].entries.append(email)
-                    changes.setdefault(filter_name, []).append(email)
-                filtered_count += 1
-                print(f"  -> Added to '{filter_name}'")
-                break
 
-            elif choice in ("a", "allow"):
-                if not hasattr(manager.config, "allowed") or manager.config.allowed is None:
-                    manager.config.allowed = []
-                if email not in manager.config.allowed:
-                    manager.config.allowed.append(email)
-                allowed_count += 1
-                print("  -> Allowed (skipped)")
-                break
+def _check_pending_changes(
+    manager: FilterManager, *, interactive: bool | None = None
+) -> None:
+    """Surface unpushed changes left behind by an earlier session.
 
-            elif choice in ("k", "skip"):
-                skipped_count += 1
-                print("  -> Skipped (will appear next time)")
-                break
+    Triage skips senders that already appear in the *local* ``filters.yaml``, so
+    a session where ``apply`` was declined leaves Gmail without those filters
+    while ``label``/``audit`` quietly stop offering the senders. Rather than
+    hide that drift, warn about it up front and offer to push.
+    """
+    pending = _pending_local_changes(manager)
+    if not pending:
+        return
 
-            elif choice in ("s", "spam"):
-                _add_to_spam(manager.config, email)
-                changes.setdefault("spam", []).append(email)
-                spammed_count += 1
-                print("  -> Marked as spam (delete)")
-                print("  Reporting existing messages as spam...", end=" ", flush=True)
-                try:
-                    reported = manager.client.report_spam([email])
-                    if reported:
-                        print(f"reported {reported} message(s).")
-                    else:
-                        print("no existing messages found.")
-                except Exception as e:
-                    print(f"error: {e}")
-                break
+    print(
+        f"\n! {len(pending)} filter(s) have changes not yet in Gmail:",
+        file=sys.stderr,
+    )
+    for change in sorted(pending, key=lambda c: c.name)[:10]:
+        details = []
+        if change.local_only:
+            details.append(f"+{len(change.local_only)} sender(s)")
+        if change.action_changed:
+            details.append("action changed")
+        if change.label_changed:
+            details.append("label changed")
+        if change.rollup_changed:
+            details.append("rollup changed")
+        print(f"    {change.name}: {', '.join(details)}", file=sys.stderr)
+    if len(pending) > 10:
+        print(f"    ... and {len(pending) - 10} more", file=sys.stderr)
 
-            elif choice in ("q", "quit"):
-                print("\nExiting triage early.")
-                should_quit = True
-                break
+    if interactive is None:
+        interactive = sys.stdin.isatty()
 
-            else:
-                print("  Invalid choice. Use f, a, s, k, or q.")
+    if not interactive:
+        print(
+            "  Run 'gfb apply' to push them; triage skips senders already in filters.yaml.",
+            file=sys.stderr,
+        )
+        return
 
-        if should_quit:
-            break
+    response = input("\nApply these to Gmail before continuing? [y/N] ").strip().lower()
+    if response not in ("y", "yes"):
+        print(
+            "  Not applying. Senders already in filters.yaml won't be offered again "
+            "until this is pushed."
+        )
+        return
 
-    # Summary
-    print(f"\n{'=' * 50}")
-    print("Triage Summary:")
-    print(f"  Filtered: {filtered_count} sender(s)")
-    print(f"  Allowed:  {allowed_count} sender(s)")
-    print(f"  Spammed:  {spammed_count} sender(s)")
-    print(f"  Skipped:  {skipped_count} sender(s)")
-    print(f"  Archived: {archived_count} sender(s)")
+    _push_to_gmail(manager, apply_to_existing=True)
 
-    if not changes and allowed_count == 0:
-        print("\nNo changes made.")
-        return 0
 
-    if changes:
-        print("\nFilters updated:")
-        for filter_name, emails in sorted(changes.items()):
-            print(f"  {filter_name}: +{len(emails)} sender(s)")
-            for email in emails:
-                print(f"    - {email}")
+def _offer_apply(manager: FilterManager) -> int:
+    """Show a push plan preview and offer to apply changes to Gmail.
 
-    # Save updated config (includes allowed list + any filter changes)
-    manager.config.save(manager.config_path)
-    print(f"\nSaved to {manager.config_path}")
-
-    # Plan preview
+    Shared by the ``label`` and ``audit`` commands. The caller is responsible
+    for having already saved the local config. Returns a process exit code.
+    """
     print("\n" + "-" * 50)
     print("Plan: changes that would be pushed to Gmail:")
     try:
@@ -881,21 +1566,99 @@ def cmd_label(manager: FilterManager, args):
         print("Not applying. You can run 'gfb apply' later.")
         return 0
 
-    print("\nApplying to Gmail...")
-    try:
-        push_results = manager.push(apply_to_existing=True, verbose=False, dry_run=False)
-        print(f"\nPushed {push_results['created']} filter(s) to Gmail.")
-        if push_results.get("skipped"):
-            print(f"Skipped {push_results['skipped']} filter(s) (no changes).")
-        if push_results.get("applied_to_existing"):
-            print(
-                f"Applied labels to {push_results['applied_to_existing']} existing conversation(s)."
-            )
-    except Exception as e:
-        print(f"Error applying: {e}", file=sys.stderr)
-        return 1
+    return _push_to_gmail(manager)
 
-    return 0
+
+# ---------------------------------------------------------------------------
+# audit command
+# ---------------------------------------------------------------------------
+
+
+def _resolve_audit_filters(config, pattern: str | None) -> tuple[list[str], str | None]:
+    """Decide which filter names to review for ``gfb audit [label]``.
+
+    Returns ``(names, error)``. ``pattern`` may be:
+      - ``None`` / empty: every filter that has entries (in config order).
+      - A glob (contains ``*`` / ``?`` / ``[``): filter names matching it.
+      - A plain name: just that filter.
+
+    Filters with no entries are skipped from the review set (nothing to audit).
+    """
+    import fnmatch
+
+    names = list(config.filters.keys())
+
+    if not pattern:
+        return [n for n in names if config.filters[n].entries], None
+
+    if any(c in pattern for c in "*?["):
+        matched = [
+            n for n in names
+            if fnmatch.fnmatchcase(n, pattern) and config.filters[n].entries
+        ]
+        return matched, None
+
+    # Exact filter name.
+    if pattern not in config.filters:
+        return [], f"Filter '{pattern}' not found in {config.filters.keys() and 'filters.yaml' or 'config'}."
+    if not config.filters[pattern].entries:
+        return [], f"Filter '{pattern}' has no entries to audit."
+    return [pattern], None
+
+
+def cmd_audit(manager: FilterManager, args):
+    """Handle ``audit [label]`` - review and recategorize existing filter entries.
+
+    Walks every entry in the selected filter(s) one at a time and lets the
+    user keep it, move it to another filter (typeahead), send it to spam, or
+    remove it entirely. There is no "allow" action: the entries being audited
+    are already bucketed into a label.
+
+    ``label`` selects which filters to review:
+      - omitted        every filter with entries, starting from the first
+      - ``newsletters/*``  every filter name matching the glob
+      - ``newsletters``    just that one filter
+    """
+    pattern = getattr(args, "label", None)
+
+    # Same drift check as `label`: unpushed changes mean these entries look
+    # categorised locally while Gmail is still unaware of them.
+    _check_pending_changes(manager)
+
+    review, err = _resolve_audit_filters(manager.config, pattern)
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        return 1
+    if not review:
+        print("No filters with entries to review.")
+        return 0
+
+    # Snapshot the entries to review as a flat ordered list so a removed/moved
+    # entry doesn't shift iteration indices mid-loop, and undo can rewind to
+    # a stable position.
+    items: list[tuple[str, str]] = []
+    for fn in review:
+        for entry in list(manager.config.filters[fn].entries):
+            items.append((fn, entry))
+
+    if not items:
+        print("No entries to review.")
+        return 0
+
+    total = len(items)
+    scope = review[0] if len(review) == 1 else f"{len(review)} filter(s)"
+    print(f"Auditing {total} entr{'y' if total == 1 else 'ies'} across {scope}.")
+    state = TriageState(config=manager.config)
+    controller = TriageController(manager, state)
+    session = TriageSession(
+        manager,
+        state,
+        controller,
+        kind="audit",
+        items=[Item(email=entry, filter_name=fn) for fn, entry in items],
+    )
+    result = run_triage(session)
+    return _finish_triage(manager, session, result, audit=True)
 
 
 def _is_sender_filtered(email: str, config) -> bool:
@@ -955,84 +1718,6 @@ def _add_to_spam(config, email: str):
         config.filters["spam"].entries.append(email)
 
 
-def _prompt_filter_selection(config, questionary_module):
-    """Prompt user to select a filter.
-
-    Shows top 5 most popular filters (by entry count) as a selectable list,
-    plus an "Other (type name)" option. If "Other" is chosen, falls back to
-    autocomplete from all existing filter names.
-    """
-    from prompt_toolkit.styles import Style
-
-    no_bg_style = Style.from_dict(
-        {
-            "selected": "",
-            "pointer": "",
-            "highlighted": "",
-        }
-    )
-
-    filter_names = list(config.filters.keys())
-
-    if not filter_names:
-        return None
-
-    # Top 5 most popular by entry count
-    by_count = sorted(
-        filter_names,
-        key=lambda n: len(config.filters[n].entries),
-        reverse=True,
-    )
-    top_5 = by_count[:5]
-
-    # Build selectable choices with entry counts
-    choices = []
-    for name in top_5:
-        choices.append(
-            questionary_module.Choice(
-                title=f"{name} ({len(config.filters[name].entries)} entries)",
-                value=name,
-            )
-        )
-
-    if len(filter_names) > 5:
-        choices.append(
-            questionary_module.Choice(
-                title="Other (type name)",
-                value="__other__",
-            )
-        )
-
-    choices.append(
-        questionary_module.Choice(
-            title="Archive (archive this message + future emails from sender)",
-            value="__archive__",
-        )
-    )
-
-    try:
-        choice = questionary_module.select(
-            "  Select filter:",
-            choices=choices,
-            style=no_bg_style,
-        ).ask()
-
-        if choice is None:
-            return None
-
-        if choice == "__other__":
-            # Fall back to autocomplete for custom selection
-            choice = questionary_module.autocomplete(
-                "  Type filter name:",
-                choices=filter_names,
-                style=no_bg_style,
-            ).ask()
-
-        return choice
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-
 def cmd_help(args):
     """Handle help command - show detailed help information."""
     topic = args.topic
@@ -1056,6 +1741,22 @@ Available Commands:
   label             Interactively triage and label email senders
                     Usage: gmail-filter-bot label [folder] [--max-messages N]
                                       [--rollup]
+
+  audit             Review and recategorize existing filter entries
+                    Usage: gmail-filter-bot audit [label|glob]
+                    Examples:
+                      gmail-filter-bot audit              # all filters
+                      gmail-filter-bot audit newsletters  # one filter
+                      gmail-filter-bot audit 'newsletters/*'  # glob match
+
+  doctor            Diagnose configuration, credentials, and Gmail connection
+                    Usage: gmail-filter-bot doctor [--no-remote] [--quiet]
+                    Usage: gmail-filter-bot doctor resolve [type]
+
+  config            Get, set, or list user settings (hand-mode, filters-path)
+                    Usage: gmail-filter-bot config ls
+                    Usage: gmail-filter-bot config get <key>
+                    Usage: gmail-filter-bot config set <key> <value>
 
   clean             Remove duplicates and optimize filter configuration
                     Usage: gmail-filter-bot clean [--dry-run]

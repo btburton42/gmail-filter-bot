@@ -1,12 +1,24 @@
 """Tests for the label command and related helpers."""
 
+import re
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from gmail_filter_bot import cli
 from gmail_filter_bot.cli import _add_to_spam, _is_sender_filtered
 from gmail_filter_bot.config import Config, Credentials, FilterConfig
-from gmail_filter_bot.gmail_client import GmailClient
+from gmail_filter_bot.gmail_client import GmailClient, Sender, SenderMessage
+
+
+def sender(name, email, *messages):
+    """Build a ``Sender`` for tests.
+
+    ``messages`` are ``(subject, message_id)`` pairs, or bare message IDs
+    (which become ``Subject <id>``).
+    """
+    pairs = [m if isinstance(m, tuple) else (f"Subject {m}", m) for m in messages]
+    return Sender(name, email, tuple(SenderMessage(s, i) for s, i in pairs))
 
 
 @pytest.fixture
@@ -262,14 +274,15 @@ class TestListSenders:
         assert "alice@example.com" in emails
         assert "bob@example.com" in emails
         assert len(emails) == 2
-        # All subjects are collected per sender
-        subjects_map = {s[1]: s[2] for s in senders}
-        assert subjects_map["alice@example.com"] == ["Hello World", "Another message"]
-        assert subjects_map["bob@example.com"] == ["Re: Project Update"]
-        # Message IDs are present (first occurrence)
-        msg_ids = {s[1]: s[3] for s in senders}
-        assert msg_ids["alice@example.com"] == "1"
-        assert msg_ids["bob@example.com"] == "2"
+        # Every message is kept per sender so triage can step through them
+        by_email = {s.email: s for s in senders}
+        alice = by_email["alice@example.com"]
+        assert alice.subjects == ["Hello World", "Another message"]
+        assert [m.message_id for m in alice.messages] == ["1", "3"]
+        assert alice.message_id == "1"  # newest first, for unsubscribe/archive
+        bob = by_email["bob@example.com"]
+        assert bob.subjects == ["Re: Project Update"]
+        assert bob.message_id == "2"
 
     def test_list_senders_respects_max_results(self):
         client = _make_mock_client()
@@ -586,3 +599,376 @@ class TestResolveLabelId:
         client = MagicMock()
         client.list_labels = Mock(return_value={"Work": "Label_456"})
         assert GmailClient._resolve_label_id(client, "Nonexistent") is None
+
+
+class TestPendingChangesPreflight:
+    """Unpushed changes from an earlier session are surfaced, not hidden."""
+
+    def _manager(self, changes):
+        from gmail_filter_bot.filter_manager import FilterChange
+
+        mgr = MagicMock()
+        mgr.detect_changes.return_value = [
+            FilterChange(name=name, local_only=entries) for name, entries in changes
+        ]
+        mgr.push.return_value = {
+            "created": 1,
+            "updated": 0,
+            "skipped": 0,
+            "applied_to_existing": 3,
+        }
+        return mgr
+
+    def test_no_pending_changes_is_silent(self, capsys):
+        import gmail_filter_bot.cli as cli
+
+        mgr = self._manager([])
+        cli._check_pending_changes(mgr, interactive=False)
+        assert capsys.readouterr().err == ""
+
+    def test_ignores_remote_only_changes(self):
+        import gmail_filter_bot.cli as cli
+        from gmail_filter_bot.filter_manager import FilterChange
+
+        mgr = MagicMock()
+        mgr.detect_changes.return_value = [FilterChange(name="work", remote_only={"b@x.com"})]
+        assert cli._pending_local_changes(mgr) == []
+
+    def test_detection_failure_is_not_fatal(self):
+        import gmail_filter_bot.cli as cli
+
+        mgr = MagicMock()
+        mgr.detect_changes.side_effect = RuntimeError("api down")
+        assert cli._pending_local_changes(mgr) == []
+
+    def test_non_interactive_warns_and_keeps_going(self, capsys):
+        import gmail_filter_bot.cli as cli
+
+        mgr = self._manager([("work", {"a@x.com", "b@x.com"})])
+        cli._check_pending_changes(mgr, interactive=False)
+
+        err = capsys.readouterr().err
+        assert "1 filter(s) have changes not yet in Gmail" in err
+        assert "work: +2 sender(s)" in err
+        assert "gfb apply" in err
+        mgr.push.assert_not_called()
+
+    def test_interactive_declined_does_not_push(self, capsys, monkeypatch):
+        import gmail_filter_bot.cli as cli
+
+        mgr = self._manager([("work", {"a@x.com"})])
+        monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+        cli._check_pending_changes(mgr, interactive=True)
+
+        mgr.push.assert_not_called()
+        assert "won't be offered again" in capsys.readouterr().out
+
+    def test_interactive_accepted_pushes(self, monkeypatch, capsys):
+        import gmail_filter_bot.cli as cli
+
+        mgr = self._manager([("work", {"a@x.com"})])
+        monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+        cli._check_pending_changes(mgr, interactive=True)
+
+        mgr.push.assert_called_once()
+        out = capsys.readouterr().out
+        assert "Pushed 1 filter(s)" in out
+        assert "3 existing conversation(s)" in out
+
+    def test_warning_lists_at_most_ten_filters(self, capsys):
+        import gmail_filter_bot.cli as cli
+
+        mgr = self._manager([(f"f{i}", {"a@x.com"}) for i in range(13)])
+        cli._check_pending_changes(mgr, interactive=False)
+
+        err = capsys.readouterr().err
+        assert "13 filter(s)" in err
+        assert "... and 3 more" in err
+
+    def test_cmd_label_runs_the_preflight(self, monkeypatch, tmp_path):
+        import argparse
+
+        import gmail_filter_bot.cli as cli
+        from gmail_filter_bot import settings
+        from gmail_filter_bot.config import Config, Credentials
+        from gmail_filter_bot.filter_manager import FilterManager
+
+        monkeypatch.setattr(settings, "user_config_path", lambda: tmp_path / "c.yaml")
+        cfg = Config(
+            max_entries_per_filter=50,
+            filters={},
+            credentials=Credentials(client_id="x", client_secret="y"),
+            allowed=[],
+        )
+        client = MagicMock()
+        client._resolve_label_id.return_value = "INBOX"
+        client.list_senders.return_value = []
+        mgr = FilterManager(cfg, client, tmp_path / "filters.yaml")
+
+        calls = []
+        monkeypatch.setattr(cli, "_check_pending_changes", lambda m: calls.append(m))
+
+        cli.cmd_label(mgr, argparse.Namespace(folder="Inbox", max_messages=200, rollup=False))
+        assert calls == [mgr]
+
+
+# --- the interactive session, without the terminal -------------------------
+#
+# cmd_label's middle is a Textual app. Rather than drive escape sequences, these
+# tests replace ``cli.run_triage`` with a function that plays a scripted set of
+# decisions against the real session object, then assert on the plain-text
+# aftermath that cmd_label prints once the app is gone. The widgets themselves
+# are covered in ``test_tui_screens.py``.
+
+
+def _build_manager(tmp_path, senders, *, filters=None, allowed=None):
+    """A FilterManager wired to a MagicMock Gmail client."""
+    from gmail_filter_bot.filter_manager import FilterManager
+
+    cfg = Config(
+        max_entries_per_filter=50,
+        filters=filters or {},
+        credentials=Credentials(client_id="x", client_secret="y"),
+        allowed=list(allowed or []),
+    )
+    client = MagicMock()
+    client._resolve_label_id.return_value = "INBOX"
+    client.list_senders.return_value = senders
+    client.report_spam.return_value = 3
+    client.archive_message.return_value = True
+    client.get_unsubscribe_targets.return_value = None
+    client.apply_label_to_existing.return_value = 0
+    mgr = FilterManager(cfg, client, tmp_path / "filters.yaml")
+    mgr.config.save = lambda path: None
+    return mgr, client, cfg
+
+
+def _run_label(monkeypatch, mgr, actions, *, keep=None, completed=True, reviewed=False):
+    """Drive cmd_label with the app replaced by ``actions``."""
+    import argparse
+
+    from gmail_filter_bot import settings
+    from gmail_filter_bot.tui.app import TriageResult
+
+    calls = {"offered": False}
+
+    def fake_run_triage(session, **_kwargs):
+        for action in actions:
+            action(session)
+        if reviewed:
+            return TriageResult(session=session, completed=completed, keep=keep, reviewed=True)
+        return TriageResult(
+            session=session, completed=completed, keep=keep, reviewed=reviewed
+        )
+
+    def fake_offer(_manager):
+        calls["offered"] = True
+        return 0
+
+    # Keep settings writes next to the manager's config, never in the repo.
+    monkeypatch.setattr(
+        settings, "user_config_path", lambda: mgr.config_path.parent / "cfg.yaml"
+    )
+    monkeypatch.setattr(cli, "run_triage", fake_run_triage)
+    monkeypatch.setattr(cli, "_check_pending_changes", lambda m: None)
+    monkeypatch.setattr(cli, "_offer_apply", fake_offer)
+    args = argparse.Namespace(folder="Inbox", max_messages=200, rollup=False)
+    rc = cli.cmd_label(mgr, args)
+    return rc, calls
+
+
+def _first(session):
+    """Apply an action to the first item, wherever the cursor is."""
+    return lambda s: s
+
+
+class TestFreshFetchSemantics:
+    """Each run refetches from Gmail; already-triaged senders are filtered out."""
+
+    def test_triaged_senders_are_not_offered_again(self, monkeypatch, tmp_path, capsys):
+        from gmail_filter_bot.config import FilterConfig
+
+        mgr, client, _cfg = _build_manager(
+            tmp_path,
+            senders=[
+                sender("The Epoch Times", "newsletter@mail.theepochtimes.com", ("S", "m1")),
+                sender("Friend", "known@friend.com", ("S", "m2")),
+                sender("New Sender", "new@x.com", ("S", "m3")),
+            ],
+            # State after a session where apply was declined: local entry, no filter.
+            filters={
+                "newsletters": FilterConfig(
+                    "newsletters",
+                    "label_and_archive",
+                    "Newsletters",
+                    ["newsletter@mail.theepochtimes.com"],
+                )
+            },
+            allowed=["known@friend.com"],
+        )
+
+        seen: list[list[str]] = []
+
+        def capture(session):
+            seen.append([item.email for item in session.items])
+
+        _run_label(monkeypatch, mgr, [capture], completed=False)
+        out = capsys.readouterr().out
+
+        client.list_senders.assert_called_once()
+        assert "Skipping 2 sender(s)" in out
+        assert "1 sender(s) to triage" in out
+        # Only the unknown sender reaches the session.
+        assert seen == [["new@x.com"]]
+
+
+class TestCmdLabelAftermath:
+    """What cmd_label prints and does once the app has exited."""
+
+    def test_filtering_saves_and_offers_to_push(self, monkeypatch, tmp_path, capsys):
+        mgr, _client, cfg = _build_manager(
+            tmp_path, senders=[sender("Alice", "a@x.com", ("S", "m1"))]
+        )
+        rc, calls = _run_label(
+            monkeypatch, mgr, [lambda s: s.filter_item(s.current, "work")]
+        )
+
+        assert rc == 0
+        assert calls["offered"] is True
+        assert "a@x.com" in cfg.filters["work"].entries
+        out = capsys.readouterr().out
+        assert "Triage Summary:" in out
+        assert re.search(r"Filtered:\s+1", out)
+        assert "work: +1 sender(s)" in out
+        assert "Saved to" in out
+
+    def test_skipping_everything_saves_nothing(self, monkeypatch, tmp_path, capsys):
+        mgr, _client, _cfg = _build_manager(
+            tmp_path, senders=[sender("Alice", "a@x.com", ("S", "m1"))]
+        )
+        rc, calls = _run_label(monkeypatch, mgr, [lambda s: s.skip_item(s.current)])
+
+        assert rc == 0
+        assert calls["offered"] is False
+        out = capsys.readouterr().out
+        assert re.search(r"Skipped:\s+1", out)
+        assert "No changes made." in out
+
+    def test_quit_early_reports_where_it_stopped(self, monkeypatch, tmp_path, capsys):
+        mgr, _client, _cfg = _build_manager(
+            tmp_path,
+            senders=[
+                sender("Alice", "a@x.com", ("S", "m1")),
+                sender("Bob", "b@x.com", ("S", "m2")),
+            ],
+        )
+        rc, _calls = _run_label(
+            monkeypatch,
+            mgr,
+            [lambda s: s.filter_item(s.current, "work")],
+            completed=False,
+        )
+        assert rc == 0
+        assert "nothing was sent behind your back" in capsys.readouterr().out
+
+
+class TestDeferredQueue:
+    """Spam and unsubscribe are queued during the session and fired once after."""
+
+    def _two_senders(self, tmp_path):
+        return _build_manager(
+            tmp_path,
+            senders=[
+                sender("Spammy", "spam@x.com", ("S", "m1")),
+                sender("List", "list@x.com", ("S", "m2")),
+            ],
+        )
+
+    def test_spam_is_not_reported_until_the_queue_is_approved(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        mgr, client, _cfg = self._two_senders(tmp_path)
+
+        def decide(session):
+            session.spam_item(session.current, 0)
+            # Nothing has been sent yet: only the local filter changed.
+            assert not client.report_spam.called
+
+        _run_label(
+            monkeypatch,
+            mgr,
+            [decide],
+            keep=["spam@x.com"],
+            reviewed=True,
+        )
+        client.report_spam.assert_called_once_with(["spam@x.com"])
+        out = capsys.readouterr().out
+        assert "Sending 1 spam report(s)" in out
+        assert "spam: 3 sender(s) reported" in out
+
+    def test_skipped_at_the_review_is_never_sent(self, monkeypatch, tmp_path, capsys):
+        mgr, client, _cfg = self._two_senders(tmp_path)
+        _run_label(
+            monkeypatch,
+            mgr,
+            [lambda s: s.spam_item(s.current, 0)],
+            keep=[],
+            reviewed=True,
+        )
+        assert not client.report_spam.called
+        out = capsys.readouterr().out
+        assert "Dropped 1 queued item(s)" in out
+        assert "Nothing was sent." in out
+
+    def test_cancelling_the_review_sends_nothing(self, monkeypatch, tmp_path, capsys):
+        mgr, client, _cfg = self._two_senders(tmp_path)
+        _run_label(monkeypatch, mgr, [lambda s: s.spam_item(s.current, 0)])
+
+        assert not client.report_spam.called
+        out = capsys.readouterr().out
+        assert "left unsent" in out
+        assert "not sent yet" in out  # the summary is honest about it
+
+    def test_unsubscribe_fires_and_reports(self, monkeypatch, tmp_path, capsys):
+        from gmail_filter_bot.unsubscribe import UnsubscribeResult, UnsubscribeTargets
+
+        mgr, client, _cfg = _build_manager(
+            tmp_path, senders=[sender("List", "list@x.com", ("S", "m2"))]
+        )
+        client.get_unsubscribe_targets.return_value = UnsubscribeTargets(
+            urls=("https://lists.example/u/1",), mailtos=(), one_click=True
+        )
+        fired: list[object] = []
+
+        def fake_unsubscribe(targets):
+            fired.append(targets)
+            return UnsubscribeResult(status="one_click", message="unsubscribed via POST")
+
+        monkeypatch.setattr(
+            "gmail_filter_bot.tui.controller.unsubscribe", fake_unsubscribe
+        )
+        _run_label(
+            monkeypatch,
+            mgr,
+            [lambda s: s.unsubscribe_item(s.current, 0)],
+            keep=["list@x.com"],
+            reviewed=True,
+        )
+
+        assert len(fired) == 1
+        out = capsys.readouterr().out
+        assert "list@x.com: unsubscribed via POST" in out
+
+    def test_undo_removes_a_sender_from_the_queue(self, monkeypatch, tmp_path):
+        mgr, client, _cfg = _build_manager(
+            tmp_path, senders=[sender("Spammy", "spam@x.com", ("S", "m1"))]
+        )
+        _run_label(
+            monkeypatch,
+            mgr,
+            [lambda s: [s.spam_item(s.current, 0), s.undo()]],
+            keep=[],
+            reviewed=True,
+        )
+        # Undo emptied the queue, so there was nothing left to approve or send.
+        assert not client.report_spam.called

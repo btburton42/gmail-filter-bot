@@ -1,0 +1,91 @@
+/* A plain two-column screen with one status line.
+ *
+ * Rules of this stylesheet:
+ *  - no layers (layer order quietly changed the column order once; never again)
+ *  - every row that holds one line of text has `height: 1`, not `auto`
+ *  - both columns are visible by construction: sender first, panel second
+ */
+
+TriageScreen {
+    background: $background;
+}
+
+#main {
+    height: 1fr;
+}
+
+/* left: the sender */
+SenderPane {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 1;
+}
+
+#sender-heading {
+    height: 1;
+    color: $primary;
+    text-style: bold;
+}
+
+#sender-body {
+    height: 1fr;
+    min-height: 3;
+    background: $background;
+    color: $text;
+    scrollbar-size-vertical: 1;
+    scrollbar-size-horizontal: 0;
+}
+
+#sender-hint {
+    height: 1;
+    color: $text-muted;
+}
+
+/* right: what has been decided */
+SidePanel {
+    width: 38;
+    height: 1fr;
+    border-left: solid $panel;
+    padding: 0 1;
+}
+
+SidePanel:focus-within {
+    border-left: solid $primary;
+}
+
+#panel-heading {
+    height: 1;
+    color: $primary;
+    text-style: bold;
+}
+
+#panel-tree {
+    height: 1fr;
+    min-height: 3;
+    background: $background;
+    padding: 0;
+    scrollbar-size-vertical: 1;
+    scrollbar-size-horizontal: 0;
+}
+
+#panel-queue {
+    height: 1;
+    color: $text-muted;
+}
+
+/* one line at the bottom */
+#statusline {
+    height: 1;
+    background: $primary;
+    color: $background;
+    padding: 0 1;
+}
+
+#statusline.-alert {
+    text-style: bold;
+}
+
+/* narrow terminal: just the sender */
+.-narrow SidePanel {
+    display: none;
+}

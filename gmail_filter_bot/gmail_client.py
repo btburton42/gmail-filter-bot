@@ -1,9 +1,11 @@
 """Gmail API client for filter operations."""
 
+from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -13,6 +15,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from .config import Credentials
+from .preview import message_preview
+from .unsubscribe import UnsubscribeTargets, parse_list_unsubscribe
 
 # Gmail API scopes needed for filter management
 SCOPES = [
@@ -20,6 +24,37 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.labels",
     "https://www.googleapis.com/auth/gmail.modify",
 ]
+
+
+class SenderMessage(NamedTuple):
+    """One message from a sender, used by triage's message navigation."""
+
+    subject: str
+    message_id: str
+
+
+class Sender(NamedTuple):
+    """A unique sender and the messages seen from them (newest first)."""
+
+    name: str
+    email: str
+    messages: tuple[SenderMessage, ...] = ()
+
+    @property
+    def subjects(self) -> list[str]:
+        """Distinct non-empty subjects, in order of first appearance."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for msg in self.messages:
+            if msg.subject and msg.subject not in seen:
+                seen.add(msg.subject)
+                out.append(msg.subject)
+        return out
+
+    @property
+    def message_id(self) -> str:
+        """The newest message ID for this sender ("" when unknown)."""
+        return self.messages[0].message_id if self.messages else ""
 
 
 class GmailClient:
@@ -30,6 +65,9 @@ class GmailClient:
         self.credentials = credentials
         self.token_path = token_path
         self.service = None
+        # message_id -> rendered preview lines, so repeated `e` presses in
+        # triage don't refetch the same body.
+        self._preview_cache: dict[tuple[str, int, int], list[str]] = {}
         self._authenticate()
 
     def _authenticate(self):
@@ -485,9 +523,7 @@ class GmailClient:
             return match.group(0)
         return from_header.strip()
 
-    def list_senders(
-        self, label_id: str, max_results: int = 200
-    ) -> list[tuple[str, str, list[str], str]]:
+    def list_senders(self, label_id: str, max_results: int = 200) -> list[Sender]:
         """Fetch unique senders from messages with the given label.
 
         Args:
@@ -495,11 +531,11 @@ class GmailClient:
             max_results: Maximum number of recent messages to fetch
 
         Returns:
-            List of (display_name, email_address, subjects, message_id) tuples,
-            where subjects is a list of all subjects seen for that sender,
-            deduplicated by email address, preserving order of first appearance.
+            One :class:`Sender` per email address, in order of first
+            appearance. Each carries every message seen from that sender so
+            triage can step through them (``←``/``→``) and expand any one body.
         """
-        sender_map: dict[str, tuple[str, list[str], str]] = {}
+        sender_map: dict[str, tuple[str, list[SenderMessage]]] = {}
         fetched = 0
         page_token = None
 
@@ -555,10 +591,10 @@ class GmailClient:
                             if not display_name:
                                 display_name = email_addr
                             if email_addr not in sender_map:
-                                sender_map[email_addr] = (display_name, [], msg["id"])
-                            sender_entry = sender_map[email_addr]
-                            if subject and subject not in sender_entry[1]:
-                                sender_entry[1].append(subject)
+                                sender_map[email_addr] = (display_name, [])
+                            sender_map[email_addr][1].append(
+                                SenderMessage(subject, msg["id"])
+                            )
                 except HttpError:
                     continue
                 fetched += 1
@@ -568,6 +604,75 @@ class GmailClient:
                 break
 
         return [
-            (name, email, subjects, msg_id)
-            for email, (name, subjects, msg_id) in sender_map.items()
+            Sender(name, email, tuple(messages))
+            for email, (name, messages) in sender_map.items()
         ]
+
+    def get_unsubscribe_targets(self, message_id: str) -> UnsubscribeTargets | None:
+        """Read a message's ``List-Unsubscribe`` headers.
+
+        Args:
+            message_id: ID of a message from the sender in question
+                (``list_senders`` returns one per sender).
+
+        Returns:
+            Parsed targets, or ``None`` when the message advertises no way to
+            unsubscribe (or the message can't be read).
+        """
+        try:
+            msg_data = (
+                self.service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="metadata",
+                    metadataHeaders=["List-Unsubscribe", "List-Unsubscribe-Post"],
+                )
+                .execute()
+            )
+        except HttpError:
+            return None
+
+        headers = {
+            h.get("name", "").lower(): h.get("value", "")
+            for h in msg_data.get("payload", {}).get("headers", [])
+        }
+        return parse_list_unsubscribe(
+            headers.get("list-unsubscribe"),
+            headers.get("list-unsubscribe-post"),
+        )
+
+    def get_message_preview(
+        self, message_id: str, max_lines: int = 4, max_chars: int = 400
+    ) -> list[str]:
+        """Return body lines of a message for triage's ``expand`` / ``↓`` action.
+
+        Args:
+            message_id: ID of the message to read.
+            max_lines: How many non-empty body lines to return.
+            max_chars: How much body text to extract before splitting lines.
+
+        Returns:
+            Body lines (empty when the message has no readable text).
+        """
+        key = (message_id, max_lines, max_chars)
+        cached = self._preview_cache.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            msg_data = (
+                self.service.users()
+                .messages()
+                .get(userId="me", id=message_id, format="full")
+                .execute()
+            )
+        except HttpError:
+            return []
+
+        lines = message_preview(
+            msg_data.get("payload"), max_lines=max_lines, max_chars=max_chars
+        )
+        self._preview_cache[key] = lines
+        return lines

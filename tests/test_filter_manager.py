@@ -1329,3 +1329,125 @@ class TestScrambledFilters:
 
         result = filter_manager._has_remote_rollup_filters("automated/bills", [])
         assert result is False
+
+class TestPushChurnRegression:
+    """Regression tests for the filter-churn bugs fixed by content-keyed upsert.
+
+    These guard against two root causes of mass delete+recreate churn:
+      1. Split filters matched by entry overlap with a same-index requirement
+         drifted and caused most parts to be deleted+recreated on every push.
+      2. Filters colliding on ``(action, label)`` — e.g. ``delete`` and ``spam``
+         both map to ``(delete, None)`` — were both attributed to the first match,
+         so changing one churned the other on every push.
+    """
+
+    def test_append_one_sender_to_split_touches_only_changed_part(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Appending one sender to a 3-part split filter must create/delete only
+        the part that actually changed, not churn all parts."""
+        mock_config.filters.clear()
+        # 3 parts of 50: parts 1 & 2 full, part 3 has 6 entries.
+        entries = [f"email{i}@example.com" for i in range(106)]
+        mock_config.filters["big"] = FilterConfig(
+            name="big", action="label_only", label="Big", entries=entries,
+        )
+
+        # Remote is in sync: 3 parts with the exact entry sets.
+        def parse_side_effect(f):
+            return {
+                "p1": entries[0:50],
+                "p2": entries[50:100],
+                "p3": entries[100:106],
+            }.get(f["id"], [])
+
+        mock_gmail_client.list_filters.return_value = [
+            {"id": "p1", "criteria": {"from": "..."}, "action": {"addLabelIds": ["Label_Big"]}},
+            {"id": "p2", "criteria": {"from": "..."}, "action": {"addLabelIds": ["Label_Big"]}},
+            {"id": "p3", "criteria": {"from": "..."}, "action": {"addLabelIds": ["Label_Big"]}},
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = parse_side_effect
+        mock_gmail_client.get_label_name.return_value = "Big"
+
+        # Append one sender -> part 3 grows from 6 to 7 entries.
+        mock_config.filters["big"].entries.append("new@example.com")
+
+        results = filter_manager.push()
+
+        # Only part 3 changed: 1 create + 1 delete. Parts 1 & 2 untouched.
+        assert results["created"] == 1
+        assert results["updated"] == 1  # one orphan (old part 3) deleted
+        assert mock_gmail_client.delete_filter.call_count == 1
+        assert mock_gmail_client.create_filter.call_count == 1
+        # The deleted id must be the old part 3, not part 1 or 2.
+        assert mock_gmail_client.delete_filter.call_args[0][0] == "p3"
+
+    def test_delete_spam_collision_no_cross_churn(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """Changing ``delete`` must not touch ``spam`` even though both collide
+        on ``(action=delete, label=None)``."""
+        mock_config.filters.clear()
+        mock_config.filters["delete"] = FilterConfig(
+            name="delete", action="delete", label=None, entries=["del@x.com"],
+        )
+        mock_config.filters["spam"] = FilterConfig(
+            name="spam", action="delete", label=None, entries=["spam@x.com"],
+        )
+
+        # Remote has one part for each, distinguished only by content.
+        def parse_side_effect(f):
+            return {"f_del": ["del@x.com"], "f_spam": ["spam@x.com"]}.get(f["id"], [])
+
+        mock_gmail_client.list_filters.return_value = [
+            {"id": "f_del", "criteria": {"from": "..."},
+             "action": {"addLabelIds": ["TRASH"]}},
+            {"id": "f_spam", "criteria": {"from": "..."},
+             "action": {"addLabelIds": ["TRASH"]}},
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = parse_side_effect
+
+        # Change delete: add a sender. spam must be left alone.
+        mock_config.filters["delete"].entries.append("newdel@x.com")
+
+        results = filter_manager.push()
+
+        # Only delete churns (1 create + 1 delete); spam is skipped.
+        assert results["created"] == 1
+        assert mock_gmail_client.delete_filter.call_count == 1
+        assert mock_gmail_client.delete_filter.call_args[0][0] == "f_del"
+        # spam is unchanged and must be skipped, not created.
+        assert "spam" not in results["split_filters"]
+
+    def test_in_sync_split_filter_is_full_noop(
+        self, filter_manager, mock_gmail_client, mock_config
+    ):
+        """A split filter whose parts all match exactly must be skipped entirely."""
+        mock_config.filters.clear()
+        entries = [f"email{i}@example.com" for i in range(120)]  # 3 parts of 50/50/20
+        mock_config.filters["big"] = FilterConfig(
+            name="big", action="label_only", label="Big", entries=entries,
+        )
+
+        def parse_side_effect(f):
+            return {
+                "p1": entries[0:50],
+                "p2": entries[50:100],
+                "p3": entries[100:120],
+            }.get(f["id"], [])
+
+        mock_gmail_client.list_filters.return_value = [
+            {"id": "p1", "criteria": {"from": "..."}, "action": {"addLabelIds": ["Label_Big"]}},
+            {"id": "p2", "criteria": {"from": "..."}, "action": {"addLabelIds": ["Label_Big"]}},
+            {"id": "p3", "criteria": {"from": "..."}, "action": {"addLabelIds": ["Label_Big"]}},
+        ]
+        mock_gmail_client.parse_filter_entries.side_effect = parse_side_effect
+        mock_gmail_client.get_label_name.return_value = "Big"
+
+        results = filter_manager.push()
+
+        assert results["created"] == 0
+        assert results["updated"] == 0
+        assert "big" not in results["split_filters"]
+        mock_gmail_client.delete_filter.assert_not_called()
+        mock_gmail_client.create_filter.assert_not_called()
